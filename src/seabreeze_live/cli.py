@@ -8,6 +8,7 @@ from pathlib import Path
 from seabreeze_live.acquisition import Streamer
 from seabreeze_live.device import list_devices, open_device
 from seabreeze_live.consumers import CsvWriter, NdjsonStdoutEmitter
+from seabreeze_live.rpc import RpcServer
 
 
 def _pick_writer(output: Path):
@@ -134,6 +135,23 @@ def _cmd_view(args: argparse.Namespace) -> int:
         device.close()
 
 
+def _cmd_serve(args: argparse.Namespace) -> int:
+    device = open_device(serial=args.serial, mock=args.mock)
+    server = RpcServer(device)
+    try:
+        server.emit_ready()
+        server.serve_forever()
+    finally:
+        # serve_forever() runs its own teardown on shutdown/EOF, but if it
+        # was interrupted before _teardown() ran (e.g. KeyboardInterrupt),
+        # this guarantees the device is closed.
+        try:
+            device.close()
+        except Exception:  # noqa: BLE001
+            pass
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     p = argparse.ArgumentParser(prog="seabreeze-live")
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -168,12 +186,20 @@ def main(argv: list[str] | None = None) -> int:
     vw.add_argument("--snapshot-format", choices=["csv", "h5"], default="csv",
                     help="snapshot file format (default: csv)")
 
+    srv = sub.add_parser(
+        "serve",
+        help="run a line-delimited JSON-RPC server on stdin/stdout (Rust bridge)",
+    )
+    srv.add_argument("--serial", default=None)
+    srv.add_argument("--mock", action="store_true")
+
     args = p.parse_args(argv)
     handlers = {
         "list": _cmd_list,
         "acquire": _cmd_acquire,
         "stream": _cmd_stream,
         "view": _cmd_view,
+        "serve": _cmd_serve,
     }
     return handlers[args.cmd](args)
 
