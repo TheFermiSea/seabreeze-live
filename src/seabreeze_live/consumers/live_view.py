@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import sys
 import time
+from pathlib import Path
 from typing import Any
 
 from seabreeze_live.frame import SpectrumFrame
+from seabreeze_live.snapshot import save_snapshot
 
 
 class MatplotlibLiveView:
@@ -12,6 +15,9 @@ class MatplotlibLiveView:
     The Streamer calls `on_frame` from its background thread and we store
     the latest frame in a single attribute. The GUI runs on the main
     thread via `run()`, polled by `matplotlib.animation.FuncAnimation`.
+
+    A "Save snapshot" button (and the `s` key) writes the most recent
+    frame to a timestamped file under `snapshot_dir`.
 
     Frame handoff is lock-free because:
       * `SpectrumFrame` is frozen,
@@ -27,6 +33,8 @@ class MatplotlibLiveView:
         refresh_ms: int = 50,
         title: str | None = None,
         wait_for_first_frame_s: float = 5.0,
+        snapshot_dir: str | Path | None = None,
+        snapshot_format: str = "csv",
     ) -> None:
         try:
             import matplotlib  # noqa: F401
@@ -38,8 +46,11 @@ class MatplotlibLiveView:
         self.refresh_ms = refresh_ms
         self.title = title
         self.wait_for_first_frame_s = wait_for_first_frame_s
+        self.snapshot_dir = Path(snapshot_dir) if snapshot_dir else Path.cwd()
+        self.snapshot_format = snapshot_format
         self._latest: SpectrumFrame | None = None
         self._closed = False
+        self._last_saved: str | None = None
 
     @property
     def latest_frame(self) -> SpectrumFrame | None:
@@ -53,6 +64,20 @@ class MatplotlibLiveView:
     def close(self) -> None:
         self._closed = True
 
+    # --- Snapshot ---
+
+    def save_snapshot_now(self) -> Path | None:
+        """Save the most recent frame to `snapshot_dir`. Returns the path,
+        or None if no frame has arrived yet.
+        """
+        frame = self._latest
+        if frame is None:
+            return None
+        path = save_snapshot(frame, self.snapshot_dir, self.snapshot_format)
+        self._last_saved = path.name
+        print(f"saved {path}", file=sys.stderr, flush=True)
+        return path
+
     # --- GUI ---
 
     def run(self) -> None:
@@ -61,6 +86,7 @@ class MatplotlibLiveView:
         """
         import matplotlib.pyplot as plt
         from matplotlib.animation import FuncAnimation
+        from matplotlib.widgets import Button
 
         deadline = time.monotonic() + self.wait_for_first_frame_s
         while self._latest is None and time.monotonic() < deadline:
@@ -73,6 +99,7 @@ class MatplotlibLiveView:
 
         frame0 = self._latest
         fig, ax = plt.subplots()
+        fig.subplots_adjust(bottom=0.18)
         (line,) = ax.plot(frame0.axis, frame0.values)
         ax.set_xlabel(f"wavelength ({frame0.axis_units})")
         ax.set_ylabel(frame0.value_units)
@@ -83,6 +110,28 @@ class MatplotlibLiveView:
             family="monospace", fontsize=9,
         )
 
+        btn_ax = fig.add_axes((0.78, 0.03, 0.18, 0.07))
+        save_button = Button(btn_ax, "Save snapshot")
+
+        hint_ax = fig.add_axes((0.04, 0.03, 0.7, 0.07))
+        hint_ax.axis("off")
+        hint_text = hint_ax.text(
+            0.0, 0.5,
+            f"snapshots → {self.snapshot_dir}  (button or 's' key)",
+            transform=hint_ax.transAxes, va="center",
+            family="monospace", fontsize=9,
+        )
+
+        def _on_save(_event: Any) -> None:
+            self.save_snapshot_now()
+
+        def _on_key(event: Any) -> None:
+            if event.key == "s":
+                self.save_snapshot_now()
+
+        save_button.on_clicked(_on_save)
+        fig.canvas.mpl_connect("key_press_event", _on_key)
+
         def update(_: Any):
             f = self._latest
             if f is None:
@@ -90,11 +139,14 @@ class MatplotlibLiveView:
             line.set_ydata(f.values)
             ax.relim()
             ax.autoscale_view(scalex=False, scaley=True)
-            info.set_text(
+            txt = (
                 f"frame {f.frame_number}\n"
                 f"int_time {f.integration_time_us / 1000:.1f} ms\n"
                 f"max {float(f.values.max()):.0f}"
             )
+            if self._last_saved is not None:
+                txt += f"\nlast saved: {self._last_saved}"
+            info.set_text(txt)
             return ()
 
         anim = FuncAnimation(
@@ -104,6 +156,8 @@ class MatplotlibLiveView:
             blit=False,
             cache_frame_data=False,
         )
+        # Keep handler references alive for the duration of plt.show().
+        _ = (save_button, hint_text)
         try:
             plt.show()
         finally:
