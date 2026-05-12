@@ -103,6 +103,47 @@ One JSON object per line on stdout, fixed envelope:
 
 A Rust parent process (e.g. a future `crates/driver-seabreeze` in rust-daq that spawns this CLI) can read `stdout` line-by-line and map each object to `SpectrumData` directly.
 
+## JSON-RPC stdio protocol (Rust bridge)
+
+For tighter integration with a Rust parent (e.g. `crates/driver-seabreeze` in rust-daq), the `serve` subcommand replaces the implicit lifecycle of `stream`: the parent opens the spectrometer once, drives it via line-delimited JSON-RPC 2.0 on `stdin`, and reads spectrum frames + RPC responses from `stdout`.
+
+```bash
+python -m seabreeze_live serve --mock
+```
+
+On startup the server writes one banner line:
+
+```json
+{"jsonrpc":"2.0","ready":true,"device":{"model":"MockSpectrometer","serial":"MOCK000000","pixel_count":2048,"integration_time_limits_us":[1000,10000000]}}
+```
+
+Then it reads one JSON-RPC request per `stdin` line and writes exactly one JSON line per response. While streaming, NDJSON spectrum frames (same schema as `seabreeze-live stream`) interleave with RPC responses on `stdout`.
+
+**Discriminator:** RPC responses always carry `"jsonrpc": "2.0"`. NDJSON spectrum frames never carry that key — they always carry `"type": "spectrum"`. A Rust parent should branch on the presence of `jsonrpc` before parsing.
+
+### Methods
+
+| Method | Params | Result |
+|---|---|---|
+| `set_integration_time_us` | `{value: int}` | `{ok: true}` |
+| `set_trigger_mode` | `{mode: "NORMAL"\|...}` | `{ok: true}` — non-`NORMAL` modes return a JSON-RPC error on the mock |
+| `get_wavelengths` | `{}` | `[float, ...]` (length = `pixel_count`) |
+| `get_device_info` | `{}` | `{model, serial, pixel_count, integration_time_limits_us: [int, int]}` |
+| `start_stream` | `{integration_time_us?: int}` | `{ok: true}` — begins emitting NDJSON spectrum frames on stdout |
+| `stop_stream` | `{}` | `{ok: true}` (or `{ok: true, was_running: false}`) |
+| `shutdown` | `{}` | `{ok: true}` — server stops the stream, closes the device, exits 0 |
+
+Errors use the standard envelope:
+
+```json
+{"jsonrpc":"2.0","id":7,"error":{"code":-32601,"message":"unknown method 'foo'"}}
+```
+
+### How `serve` differs from `stream`
+
+- `stream` opens the device, applies a fixed integration time from CLI args, and streams until the parent kills it (SIGINT/SIGTERM/EOF). No mid-run control.
+- `serve` opens the device and waits — no streaming until the parent calls `start_stream`. Integration time, trigger mode, and stream lifecycle are all driven over `stdin`. `serve` is the supported entry point for the Rust driver.
+
 ## Architecture
 
 ```
