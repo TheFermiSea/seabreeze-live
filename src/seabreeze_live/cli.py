@@ -94,7 +94,16 @@ def _cmd_view(args: argparse.Namespace) -> int:
     device = open_device(serial=args.serial, mock=args.mock)
     try:
         device.set_integration_time(args.integration_us)
-        view = MatplotlibLiveView(refresh_ms=args.refresh_ms)
+        view = MatplotlibLiveView(
+            refresh_ms=args.refresh_ms,
+            snapshot_dir=args.snapshot_dir,
+            snapshot_format=args.snapshot_format,
+        )
+        print(
+            f"snapshots will be saved to {view.snapshot_dir} "
+            f"(button or 's' key, format={args.snapshot_format})",
+            file=sys.stderr,
+        )
         consumers = [view]
         if args.save is not None:
             consumers.append(_pick_writer(args.save))
@@ -153,7 +162,11 @@ def main(argv: list[str] | None = None) -> int:
     vw.add_argument("--refresh-ms", type=int, default=50,
                     help="plot refresh interval in ms (default 50)")
     vw.add_argument("--save", type=Path, default=None,
-                    help="also record to this file (.h5/.hdf5 or .csv)")
+                    help="also record every frame to this file (.h5/.hdf5 or .csv)")
+    vw.add_argument("--snapshot-dir", type=Path, default=Path.cwd(),
+                    help="directory for button/keypress snapshots (default: CWD)")
+    vw.add_argument("--snapshot-format", choices=["csv", "h5"], default="csv",
+                    help="snapshot file format (default: csv)")
 
     args = p.parse_args(argv)
     handlers = {
