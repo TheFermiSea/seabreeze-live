@@ -23,6 +23,23 @@ def _pick_writer(output: Path):
     )
 
 
+def _arm_interrupt_signals() -> None:
+    """Make SIGINT/SIGTERM raise KeyboardInterrupt.
+
+    Python at startup inherits SIGINT's disposition from the parent. If we
+    were launched in the background by a shell (e.g. `cmd &`), bash sets
+    SIGINT to SIG_IGN, and Python keeps it that way — so `kill -INT` would
+    silently do nothing. Re-arming guarantees that an external shutdown
+    request always reaches the streamer cleanup path.
+    """
+    signal.signal(signal.SIGINT, signal.default_int_handler)
+
+    def _term(_signum, _frame):
+        raise KeyboardInterrupt
+
+    signal.signal(signal.SIGTERM, _term)
+
+
 def _cmd_list(_args: argparse.Namespace) -> int:
     devs = list_devices()
     if not devs:
@@ -34,6 +51,7 @@ def _cmd_list(_args: argparse.Namespace) -> int:
 
 
 def _cmd_acquire(args: argparse.Namespace) -> int:
+    _arm_interrupt_signals()
     device = open_device(serial=args.serial, mock=args.mock)
     try:
         device.set_integration_time(args.integration_us)
@@ -53,6 +71,7 @@ def _cmd_acquire(args: argparse.Namespace) -> int:
 
 
 def _cmd_stream(args: argparse.Namespace) -> int:
+    _arm_interrupt_signals()
     device = open_device(serial=args.serial, mock=args.mock)
     try:
         device.set_integration_time(args.integration_us)
