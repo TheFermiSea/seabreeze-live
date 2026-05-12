@@ -51,6 +51,7 @@ class MatplotlibLiveView:
         self._latest: SpectrumFrame | None = None
         self._closed = False
         self._last_saved: str | None = None
+        self._fig: Any = None  # set by run(); enables PNG dump alongside data
 
     @property
     def latest_frame(self) -> SpectrumFrame | None:
@@ -67,16 +68,25 @@ class MatplotlibLiveView:
     # --- Snapshot ---
 
     def save_snapshot_now(self) -> Path | None:
-        """Save the most recent frame to `snapshot_dir`. Returns the path,
-        or None if no frame has arrived yet.
+        """Save the most recent frame to `snapshot_dir`. Returns the data
+        path (None if no frame has arrived yet). When called from the GUI
+        (i.e. `_fig` is set), a matching `.png` of the current plot is
+        written alongside the data file with the same timestamped stem.
         """
         frame = self._latest
         if frame is None:
             return None
-        path = save_snapshot(frame, self.snapshot_dir, self.snapshot_format)
-        self._last_saved = path.name
-        print(f"saved {path}", file=sys.stderr, flush=True)
-        return path
+        data_path = save_snapshot(frame, self.snapshot_dir, self.snapshot_format)
+        png_path: Path | None = None
+        if self._fig is not None:
+            png_path = data_path.with_suffix(".png")
+            self._fig.savefig(png_path, dpi=150, bbox_inches="tight")
+        self._last_saved = data_path.name
+        if png_path is not None:
+            print(f"saved {data_path} + {png_path.name}", file=sys.stderr, flush=True)
+        else:
+            print(f"saved {data_path}", file=sys.stderr, flush=True)
+        return data_path
 
     # --- GUI ---
 
@@ -84,9 +94,17 @@ class MatplotlibLiveView:
         """Block the calling thread on the matplotlib event loop until the
         window is closed. MUST be called from the main thread.
         """
+        import matplotlib as mpl
         import matplotlib.pyplot as plt
         from matplotlib.animation import FuncAnimation
         from matplotlib.widgets import Button
+
+        # Matplotlib's default keymap binds 's' to "save figure" (which
+        # opens a PNG save dialog and would shadow our snapshot handler).
+        # Reclaim it.
+        save_keymap = list(mpl.rcParams.get("keymap.save", []))
+        if "s" in save_keymap:
+            mpl.rcParams["keymap.save"] = [k for k in save_keymap if k != "s"]
 
         deadline = time.monotonic() + self.wait_for_first_frame_s
         while self._latest is None and time.monotonic() < deadline:
@@ -99,6 +117,7 @@ class MatplotlibLiveView:
 
         frame0 = self._latest
         fig, ax = plt.subplots()
+        self._fig = fig
         fig.subplots_adjust(bottom=0.18)
         (line,) = ax.plot(frame0.axis, frame0.values)
         ax.set_xlabel(f"wavelength ({frame0.axis_units})")
@@ -110,10 +129,12 @@ class MatplotlibLiveView:
             family="monospace", fontsize=9,
         )
 
-        btn_ax = fig.add_axes((0.78, 0.03, 0.18, 0.07))
-        save_button = Button(btn_ax, "Save snapshot")
+        btn_ax = fig.add_axes((0.74, 0.03, 0.22, 0.07))
+        save_button = Button(
+            btn_ax, f"Save {self.snapshot_format} + PNG"
+        )
 
-        hint_ax = fig.add_axes((0.04, 0.03, 0.7, 0.07))
+        hint_ax = fig.add_axes((0.04, 0.03, 0.66, 0.07))
         hint_ax.axis("off")
         hint_text = hint_ax.text(
             0.0, 0.5,
@@ -162,3 +183,4 @@ class MatplotlibLiveView:
             plt.show()
         finally:
             del anim
+            self._fig = None

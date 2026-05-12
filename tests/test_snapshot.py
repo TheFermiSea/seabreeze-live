@@ -107,3 +107,26 @@ def test_save_snapshot_now_each_call_makes_a_new_file(tmp_path):
     assert p1 is not None and p2 is not None
     assert p1 != p2
     assert sorted(p.name for p in tmp_path.iterdir()) == sorted([p1.name, p2.name])
+
+
+def test_save_snapshot_now_writes_png_when_figure_attached(tmp_path):
+    import matplotlib
+    matplotlib.use("Agg", force=True)
+    import matplotlib.pyplot as plt
+
+    d = MockDevice(simulate_exposure=False)
+    view = MatplotlibLiveView(snapshot_dir=tmp_path, snapshot_format="csv")
+    view.on_frame(_make_frame(d))
+    fig, ax = plt.subplots()
+    ax.plot([0, 1], [0, 1])
+    view._fig = fig
+    try:
+        data_path = view.save_snapshot_now()
+        assert data_path is not None
+        png_path = data_path.with_suffix(".png")
+        assert png_path.exists()
+        assert png_path.stat().st_size > 0
+        # Stems match — same timestamped basename for the pair.
+        assert data_path.stem == png_path.stem
+    finally:
+        plt.close(fig)
