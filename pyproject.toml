@@ -10,7 +10,7 @@ dependencies = [
   "scipy>=1.10.0",
   "h5py>=3.8.0",
   "textual>=0.50.0",
-  "textual-plot>=0.1.0",
+  "textual-plotext>=0.2.0",
 ]
 
 [project.optional-dependencies]

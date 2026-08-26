@@ -313,6 +313,15 @@ wheels = [
 ]
 
 [[package]]
+name = "plotext"
+version = "5.3.2"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/c9/d7/f75f397af966fe252d0d34ffd3cae765317fce2134f925f95e7d6725d1ce/plotext-5.3.2.tar.gz", hash = "sha256:52d1e932e67c177bf357a3f0fe6ce14d1a96f7f7d5679d7b455b929df517068e", size = 61967, upload-time = "2024-09-24T15:13:37.728Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/f6/1e/12fe7c40cd2099a1f454518754ed229b01beaf3bbb343127f0cc13ce6c22/plotext-5.3.2-py3-none-any.whl", hash = "sha256:394362349c1ddbf319548cfac17ca65e6d5dfc03200c40dfdc0503b3e95a2283", size = 64047, upload-time = "2024-09-24T15:13:36.296Z" },
+]
+
+[[package]]
 name = "pluggy"
 version = "1.6.0"
 source = { registry = "https://pypi.org/simple" }
@@ -648,7 +657,7 @@ dependencies = [
     { name = "scipy", version = "1.18.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
     { name = "seabreeze" },
     { name = "textual" },
-    { name = "textual-plot" },
+    { name = "textual-plotext" },
 ]
 
 [package.optional-dependencies]
@@ -666,7 +675,7 @@ requires-dist = [
     { name = "scipy", specifier = ">=1.10.0" },
     { name = "seabreeze", specifier = ">=2.0.0" },
     { name = "textual", specifier = ">=0.50.0" },
-    { name = "textual-plot", specifier = ">=0.1.0" },
+    { name = "textual-plotext", specifier = ">=0.2.0" },
 ]
 provides-extras = ["dev"]
 
@@ -688,32 +697,16 @@ wheels = [
 ]
 
 [[package]]
-name = "textual-hires-canvas"
-version = "0.14.0"
+name = "textual-plotext"
+version = "1.0.1"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
-    { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
-    { name = "numpy", version = "2.4.4", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
+    { name = "plotext" },
     { name = "textual" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/20/f0/13f2a30ab7950cc3d5d5a2c893fbe3d40b4d129fd2cd30313260181578c4/textual_hires_canvas-0.14.0.tar.gz", hash = "sha256:0fa512492ddd2cd6c2a970a6beea58f5350f4cf25f40ad14ffd9fa86c6458769", size = 1251440, upload-time = "2026-01-10T22:16:56.708Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/9a/b0/e4e0f38df057db778252db0dd2c08522d7222b8537b6a0181d797b9044bd/textual_plotext-1.0.1.tar.gz", hash = "sha256:836f53a3316756609e194129a35c2875638e7958c261f541e0a794f7c98011be", size = 16489, upload-time = "2024-11-30T19:25:56.625Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/85/ea/e7e6d0f749395d61ca2ab8cda2f3c4e6613800b6b0d0b21f9d1d180c4d42/textual_hires_canvas-0.14.0-py3-none-any.whl", hash = "sha256:8cd67d656387220684449e837dd5809b6c00c5dfee8e4b494414b5837cb5a804", size = 19825, upload-time = "2026-01-10T22:16:54.69Z" },
-]
-
-[[package]]
-name = "textual-plot"
-version = "0.10.1"
-source = { registry = "https://pypi.org/simple" }
-dependencies = [
-    { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
-    { name = "numpy", version = "2.4.4", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
-    { name = "textual" },
-    { name = "textual-hires-canvas" },
-]
-sdist = { url = "https://files.pythonhosted.org/packages/a0/c2/13f9f747e83cd0b740d1bf310e89a006316cfb5acb4e5a4136c12f96340b/textual_plot-0.10.1.tar.gz", hash = "sha256:503db96d849134293228419324eb15efbadf1f1927a2e0a229b54e7a7e5d5292", size = 2451096, upload-time = "2026-02-01T13:27:43.658Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/2a/36/75eba496995e6f9a001cd601972eab753203167dfcccfbf1816e3959d28d/textual_plot-0.10.1-py3-none-any.whl", hash = "sha256:74ff3a8b2d84bd71b3a9abbac95139ff952f190e6bac60c7091911c63a1863ba", size = 50409, upload-time = "2026-02-01T13:27:41.013Z" },
+    { url = "https://files.pythonhosted.org/packages/35/53/fba7da208f9d3f59254413660fa0aa6599f2aca806f3ae356670455fd4ea/textual_plotext-1.0.1-py3-none-any.whl", hash = "sha256:6b6bfd00b29f121ddf216eaaf9bdac9d688ed72f40028484d279a10cbbb169ed", size = 16558, upload-time = "2024-11-30T19:25:32.208Z" },
 ]
 
 [[package]]
