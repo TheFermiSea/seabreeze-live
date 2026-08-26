@@ -1,25 +1,20 @@
 [project]
 name = "seabreeze-live"
-version = "0.1.0"
-description = "Live acquisition wrapper for python-seabreeze with HDF5/CSV/NDJSON output."
+version = "0.2.0"
+description = "Live Ocean Optics spectrometer acquisition and visualization TUI"
 readme = "README.md"
-authors = [
-    { name = "TheFermiSea", email = "squires.b@gmail.com" }
-]
-requires-python = ">=3.12"
+requires-python = ">=3.10"
 dependencies = [
-    "numpy>=1.26",
+  "seabreeze>=2.0.0",
+  "numpy>=1.24.0",
+  "scipy>=1.10.0",
+  "h5py>=3.8.0",
+  "textual>=0.50.0",
+  "textual-plot>=0.1.0",
 ]
 
 [project.optional-dependencies]
-hardware = ["seabreeze>=2.0"]
-hdf5 = ["h5py>=3.10"]
-plot = ["matplotlib>=3.8"]
-dev = ["pytest>=8", "pytest-cov", "h5py>=3.10", "matplotlib>=3.8"]
+dev = ["pytest>=8.0.0", "ruff>=0.2.0"]
 
 [project.scripts]
 seabreeze-live = "seabreeze_live.cli:main"
-
-[build-system]
-requires = ["uv_build>=0.8.19,<0.9.0"]
-build-backend = "uv_build"
