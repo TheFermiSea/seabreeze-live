@@ -25,11 +25,7 @@ from textual.widgets import (
     Static,
     Switch,
 )
-
-try:
-    from textual_plot.plot_widget import PlotWidget
-except ImportError:
-    from textual_plot import PlotWidget
+from textual_plot import PlotWidget
 
 from seabreeze_live.device import SpectrometerDevice
 
@@ -57,7 +53,7 @@ class LiveSpectrometerApp(App):
     }
 
     #sidebar {
-        width: 46;
+        width: 48;
         dock: left;
         background: $surface;
         border-right: double $primary;
@@ -100,7 +96,7 @@ class LiveSpectrometerApp(App):
     }
 
     .ctrl-row Label {
-        width: 20;
+        width: 22;
     }
 
     .saturated-adc {
@@ -110,7 +106,7 @@ class LiveSpectrometerApp(App):
     }
 
     #event-log {
-        height: 9;
+        height: 8;
         border: solid $surface-lighten-2;
         margin: 1;
     }
@@ -124,6 +120,7 @@ class LiveSpectrometerApp(App):
     BINDINGS = [
         Binding("q", "quit", "Quit", show=True),
         Binding("space", "toggle_pause", "Pause/Play", show=True),
+        Binding("h", "toggle_hires", "Toggle Hi-Res", show=True),
         Binding("d", "capture_dark", "Take Dark", show=True),
         Binding("w", "capture_white", "Take White", show=True),
         Binding("c", "clear_refs", "Clear Refs", show=True),
@@ -136,6 +133,9 @@ class LiveSpectrometerApp(App):
     is_paused: reactive[bool] = reactive(False)
     display_mode: reactive[str] = reactive("Raw Counts")
     autoscale_y: reactive[bool] = reactive(True)
+    hires_mode: reactive[bool] = reactive(True)
+    plot_style: reactive[str] = reactive("line")
+    wavelength_zoom: reactive[str] = reactive("full")
 
     def __init__(
         self,
@@ -147,6 +147,7 @@ class LiveSpectrometerApp(App):
         self.initial_device_id = device_id
         self.initial_integration_us = integration_time_us
         self.initial_use_mock = use_mock
+        self._is_active = True
 
         self.dev = SpectrometerDevice(device_id=device_id, use_mock=use_mock)
         self.dev.set_integration_time_micros(integration_time_us)
@@ -180,14 +181,40 @@ class LiveSpectrometerApp(App):
             yield Label("Spectrometer Selection", classes="section-head")
             yield Select([], id="select-device", prompt="Select Spectrometer")
 
+            yield Label("Plot & Line Appearance", classes="section-head")
+            with Horizontal(classes="ctrl-row"):
+                yield Label("Hi-Res Braille Lines (H):")
+                yield Switch(value=True, id="sw-hires")
+
+            with Horizontal(classes="ctrl-row"):
+                yield Label("Plot Style:")
+                yield Select(
+                    [
+                        ("Thin Line (Continuous)", "line"),
+                        ("Scatter (Points)", "scatter"),
+                        ("Line + Sample Markers", "both"),
+                    ],
+                    value="line",
+                    id="select-plot-style",
+                )
+
+            with Horizontal(classes="ctrl-row"):
+                yield Label("Spectral Range:")
+                yield Select(
+                    [
+                        ("Full Range", "full"),
+                        ("Visible (380 - 750 nm)", "vis"),
+                        ("UV Range (200 - 400 nm)", "uv"),
+                        ("NIR Range (700 - 1050 nm)", "nir"),
+                    ],
+                    value="full",
+                    id="select-wl-zoom",
+                )
+
             yield Label("Acquisition Settings", classes="section-head")
             with Horizontal(classes="ctrl-row"):
                 yield Label("Integration (µs):")
-                yield Input(
-                    value=str(self.initial_integration_us),
-                    id="inp-integration",
-                    max_length=10,
-                )
+                yield Input(value=str(self.initial_integration_us), id="inp-integration", max_length=10)
 
             with Horizontal(classes="ctrl-row"):
                 yield Label("Scans to Average:")
@@ -200,12 +227,7 @@ class LiveSpectrometerApp(App):
             with Horizontal(classes="ctrl-row"):
                 yield Label("Trigger Mode:")
                 yield Select(
-                    [
-                        ("Normal (0)", 0),
-                        ("Software (1)", 1),
-                        ("Ext Sync (2)", 2),
-                        ("Ext Hardware (3)", 3),
-                    ],
+                    [("Normal (0)", 0), ("Software (1)", 1), ("Ext Sync (2)", 2), ("Ext Hardware (3)", 3)],
                     value=0,
                     id="select-trigger",
                 )
@@ -247,9 +269,7 @@ class LiveSpectrometerApp(App):
                 yield Switch(value=True, id="sw-shutter")
 
             yield Label("Export & Recording", classes="section-head")
-            yield Select(
-                [("CSV", "CSV"), ("HDF5", "HDF5")], value="CSV", id="select-rec-fmt"
-            )
+            yield Select([("CSV", "CSV"), ("HDF5", "HDF5")], value="CSV", id="select-rec-fmt")
             yield Button("Start Recording (R)", id="btn-record", variant="primary")
             yield Button("Export Snapshot (S)", id="btn-snapshot", variant="default")
 
@@ -272,23 +292,25 @@ class LiveSpectrometerApp(App):
         sel = self.query_one("#select-device", Select)
         sel.set_options([(d["label"], d["id"]) for d in devs])
 
-        target_id = self.initial_device_id or (
-            devs[0]["id"] if devs else "MOCK-SIMULATOR"
-        )
+        target_id = self.initial_device_id or (devs[0]["id"] if devs else "MOCK-SIMULATOR")
         sel.value = target_id
 
-        self.log_msg("[bold green]TUI Ready.[/] Live streaming active.")
+        plot = self.query_one("#spectrum-plot", PlotWidget)
+        plot.hires = True
+
+        self.log_msg("[bold green]TUI Ready.[/] Live streaming with Hi-Res Braille plotting.")
         self.start_acquisition_loop()
 
+    def on_unmount(self):
+        self._is_active = False
+        self.dev.close()
+
     def log_msg(self, text: str):
-        self.query_one("#event-log", Log).write_line(
-            f"[{time.strftime('%H:%M:%S')}] {text}"
-        )
+        self.query_one("#event-log", Log).write_line(f"[{time.strftime('%H:%M:%S')}] {text}")
 
     @work(exclusive=True, thread=True)
     def start_acquisition_loop(self):
-        """Asynchronous spectrometer polling worker."""
-        while self.is_running:
+        while self._is_active:
             if not self.is_paused and self.dev.device is not None:
                 try:
                     now = time.perf_counter()
@@ -297,11 +319,7 @@ class LiveSpectrometerApp(App):
                         self.fps = 0.9 * self.fps + 0.1 * (1.0 / dt)
                     self._last_frame_t = now
 
-                    # Scan Averaging
-                    accum = np.zeros(
-                        self.dev.meta.pixels if self.dev.meta else 2048,
-                        dtype=np.float64,
-                    )
+                    accum = np.zeros(self.dev.meta.pixels if self.dev.meta else 2048, dtype=np.float64)
                     for _ in range(max(1, self.scans_to_average)):
                         accum += self.dev.get_intensities(
                             correct_dark_pixels=self.correct_dark_pixels,
@@ -309,39 +327,47 @@ class LiveSpectrometerApp(App):
                         )
                     raw = accum / max(1, self.scans_to_average)
 
-                    # Boxcar smoothing
                     if self.boxcar_width > 0:
-                        k = np.ones(self.boxcar_width * 2 + 1) / (
-                            self.boxcar_width * 2 + 1
-                        )
+                        k = np.ones(self.boxcar_width * 2 + 1) / (self.boxcar_width * 2 + 1)
                         raw = np.convolve(raw, k, mode="same")
 
                     self.latest_wl = self.dev.get_wavelengths()
                     self.latest_intensities = raw
 
-                    # Stream writer
                     if self.recording_active:
                         self._write_recording_frame(now, raw)
 
                     temps = self.dev.read_temperatures()
                     self.app.call_from_thread(self._render_frame, raw, temps)
                 except Exception as ex:
-                    self.app.call_from_thread(
-                        self.log_msg, f"[red]Acquisition error: {ex}[/]"
-                    )
+                    self.app.call_from_thread(self.log_msg, f"[red]Acquisition error: {ex}[/]")
             time.sleep(0.015)
 
     def _render_frame(self, raw: np.ndarray, temps: Dict[str, float]):
-        """Render processed spectrum and update UI metrics."""
         wl = self.latest_wl
         y_data, y_label = self._calculate_spectrum(raw)
 
-        # Status Badges
+        # Region of Interest filtering
+        if self.wavelength_zoom == "vis":
+            mask = (wl >= 380.0) & (wl <= 750.0)
+        elif self.wavelength_zoom == "uv":
+            mask = (wl >= 200.0) & (wl <= 400.0)
+        elif self.wavelength_zoom == "nir":
+            mask = (wl >= 700.0) & (wl <= 1050.0)
+        else:
+            mask = np.ones_like(wl, dtype=bool)
+
+        wl_plot = wl[mask]
+        y_plot = y_data[mask]
+
+        if len(wl_plot) == 0:
+            wl_plot = wl
+            y_plot = y_data
+
+        # Metrics
         peak_i = int(np.argmax(y_data))
         self.query_one("#badge-fps", MetricBadge).update(f"⚡ {self.fps:.1f} FPS")
-        self.query_one("#badge-peak", MetricBadge).update(
-            f"🎯 {wl[peak_i]:.1f}nm ({y_data[peak_i]:.0f})"
-        )
+        self.query_one("#badge-peak", MetricBadge).update(f"🎯 {wl[peak_i]:.1f}nm ({y_data[peak_i]:.0f})")
 
         sat_badge = self.query_one("#badge-sat", MetricBadge)
         if np.any(raw >= 65000.0):
@@ -356,55 +382,41 @@ class LiveSpectrometerApp(App):
 
         # Render to PlotWidget
         plot = self.query_one("#spectrum-plot", PlotWidget)
-        if hasattr(plot, "clear"):
-            plot.clear()
+        plot.hires = self.hires_mode
+        plot.clear()
 
-        if hasattr(plot, "plot"):
-            plot.plot(wl, y_data, color="cyan", label=self.display_mode)
-            if self.display_mode == "Raw Counts":
-                if self.dark_spectrum is not None:
-                    plot.plot(
-                        wl, self.dark_spectrum, color="gray", label="Dark Baseline"
-                    )
-                if self.white_spectrum is not None:
-                    plot.plot(
-                        wl, self.white_spectrum, color="yellow", label="White Reference"
-                    )
+        if self.plot_style == "scatter":
+            plot.scatter(wl_plot, y_plot, label=self.display_mode)
+        elif self.plot_style == "both":
+            plot.plot(wl_plot, y_plot, label=self.display_mode)
+            if len(wl_plot) > 16:
+                plot.scatter(wl_plot[::16], y_plot[::16], label="Sample Points")
+        else:
+            plot.plot(wl_plot, y_plot, label=self.display_mode)
 
-        dev_title = (
-            f"{self.dev.meta.model} ({self.dev.meta.serial_number})"
-            if self.dev.meta
-            else "Disconnected"
-        )
-        if hasattr(plot, "title"):
-            plot.title = f"Live Spectra | {dev_title}"
-        if hasattr(plot, "xlabel"):
-            plot.xlabel = "Wavelength (nm)"
-        if hasattr(plot, "ylabel"):
-            plot.ylabel = y_label
+        # Baseline Overlays
+        if self.display_mode == "Raw Counts":
+            if self.dark_spectrum is not None:
+                plot.plot(wl_plot, self.dark_spectrum[mask], label="Dark Baseline")
+            if self.white_spectrum is not None:
+                plot.plot(wl_plot, self.white_spectrum[mask], label="White Reference")
+
+        dev_title = f"{self.dev.meta.model} ({self.dev.meta.serial_number})" if self.dev.meta else "Disconnected"
+        plot.title = f"Live Spectra | {dev_title}"
+        plot.xlabel = "Wavelength (nm)"
+        plot.ylabel = y_label
 
         if not self.autoscale_y:
             if self.display_mode == "Raw Counts":
-                if hasattr(plot, "set_ylim"):
-                    plot.set_ylim(0, 65535)
-                elif hasattr(plot, "ylim"):
-                    plot.ylim = (0, 65535)
+                plot.ylim = (0, 65535)
             elif self.display_mode == "Transmission (%)":
-                if hasattr(plot, "set_ylim"):
-                    plot.set_ylim(-5, 110)
-                elif hasattr(plot, "ylim"):
-                    plot.ylim = (-5, 110)
+                plot.ylim = (-5, 110)
             elif self.display_mode == "Absorbance (AU)":
-                if hasattr(plot, "set_ylim"):
-                    plot.set_ylim(-0.2, 3.5)
-                elif hasattr(plot, "ylim"):
-                    plot.ylim = (-0.2, 3.5)
+                plot.ylim = (-0.2, 3.5)
         else:
-            if hasattr(plot, "set_ylim"):
-                plot.set_ylim(None, None)
-            elif hasattr(plot, "ylim"):
-                plot.ylim = None
+            plot.ylim = None
 
+        plot.xlim = (float(wl_plot[0]), float(wl_plot[-1]))
         plot.refresh()
 
     def _calculate_spectrum(self, raw: np.ndarray) -> Tuple[np.ndarray, str]:
@@ -413,9 +425,7 @@ class LiveSpectrometerApp(App):
 
         if self.display_mode == "Dark Subtracted":
             if self.dark_spectrum is not None and len(self.dark_spectrum) == len(raw):
-                return np.maximum(
-                    raw - self.dark_spectrum, 0.0
-                ), "Dark Subtracted (Counts)"
+                return np.maximum(raw - self.dark_spectrum, 0.0), "Dark Subtracted (Counts)"
             return raw, "Raw (Dark Baseline Missing!)"
 
         if self.display_mode in ("Transmission (%)", "Absorbance (AU)"):
@@ -441,6 +451,25 @@ class LiveSpectrometerApp(App):
             self._h5_dataset[curr] = raw.astype("float32")
 
     # --- UI Event Handlers ---
+
+    @on(Switch.Changed, "#sw-hires")
+    def on_hires_switch(self, event: Switch.Changed):
+        self.hires_mode = event.value
+        plot = self.query_one("#spectrum-plot", PlotWidget)
+        plot.hires = event.value
+        self.log_msg(f"Resolution: {'Thin Braille (Hi-Res)' if event.value else 'Thick Block (Standard)'}")
+
+    @on(Select.Changed, "#select-plot-style")
+    def on_plot_style_change(self, event: Select.Changed):
+        if event.value != Select.BLANK:
+            self.plot_style = str(event.value)
+            self.log_msg(f"Plot Style: [cyan]{event.value}[/]")
+
+    @on(Select.Changed, "#select-wl-zoom")
+    def on_wl_zoom_change(self, event: Select.Changed):
+        if event.value != Select.BLANK:
+            self.wavelength_zoom = str(event.value)
+            self.log_msg(f"Spectral Range: [cyan]{event.value}[/]")
 
     @on(Select.Changed, "#select-device")
     def on_device_select(self, event: Select.Changed):
@@ -535,18 +564,12 @@ class LiveSpectrometerApp(App):
             if fmt == "CSV":
                 self._csv_file = open(path, "w", newline="")
                 self._csv_writer = csv.writer(self._csv_file)
-                self._csv_writer.writerow(
-                    ["timestamp"] + [f"wl_{w:.2f}" for w in self.latest_wl]
-                )
+                self._csv_writer.writerow(["timestamp"] + [f"wl_{w:.2f}" for w in self.latest_wl])
             else:
                 self._h5_file = h5py.File(path, "w")
                 px = len(self.latest_wl)
                 self._h5_dataset = self._h5_file.create_dataset(
-                    "spectra",
-                    shape=(0, px),
-                    maxshape=(None, px),
-                    dtype="float32",
-                    chunks=True,
+                    "spectra", shape=(0, px), maxshape=(None, px), dtype="float32", chunks=True
                 )
                 self._h5_file.create_dataset("wavelengths", data=self.latest_wl)
 
@@ -574,16 +597,16 @@ class LiveSpectrometerApp(App):
         self.autoscale_y = not self.autoscale_y
         self.log_msg(f"Y-Autoscale: {'ENABLED' if self.autoscale_y else 'FIXED'}")
 
+    def action_toggle_hires(self):
+        sw = self.query_one("#sw-hires", Switch)
+        sw.value = not sw.value
+
     def action_toggle_lamp(self):
         sw = self.query_one("#sw-lamp", Switch)
         sw.value = not sw.value
 
 
-def run_tui(
-    device: Optional[str] = None,
-    integration_time_us: int = 100_000,
-    use_mock: bool = False,
-):
+def run_tui(device: Optional[str] = None, integration_time_us: int = 100_000, use_mock: bool = False):
     app = LiveSpectrometerApp(
         device_id=device,
         integration_time_us=integration_time_us,
