@@ -1,208 +1,113 @@
-from __future__ import annotations
+"""Command line interface routing TUI, CLI streaming, snapshot, and RPC modes."""
 
 import argparse
-import signal
 import sys
-from pathlib import Path
+import time
+from typing import Optional
 
-from seabreeze_live.acquisition import Streamer
-from seabreeze_live.device import list_devices, open_device
-from seabreeze_live.consumers import CsvWriter, NdjsonStdoutEmitter
-from seabreeze_live.rpc import RpcServer
+from seabreeze_live.consumers.live_view import run_tui
+from seabreeze_live.device import SpectrometerDevice
 
 
-def _pick_writer(output: Path):
-    suffix = output.suffix.lower()
-    if suffix in {".h5", ".hdf5"}:
-        from seabreeze_live.consumers import Hdf5Writer
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        prog="seabreeze-live",
+        description="High-performance live Ocean Optics spectrometer TUI & acquisition engine",
+    )
+    subparsers = parser.add_subparsers(dest="command", help="Command to execute")
 
-        return Hdf5Writer(output)
-    if suffix == ".csv":
-        return CsvWriter(output)
-    raise SystemExit(
-        f"unsupported output extension {suffix!r}; use .h5/.hdf5 or .csv"
+    # TUI Command (Default)
+    tui_parser = subparsers.add_parser(
+        "view", help="Launch interactive Textual TUI live view"
+    )
+    _add_device_args(tui_parser)
+    tui_parser.set_defaults(
+        func=lambda args: run_tui(args.device, args.integration_time, args.mock)
+    )
+
+    # CLI Stream Command
+    stream_parser = subparsers.add_parser(
+        "stream", help="Headless terminal streaming output"
+    )
+    _add_device_args(stream_parser)
+    stream_parser.add_argument(
+        "--format", choices=["stdout", "ndjson"], default="stdout"
+    )
+    stream_parser.set_defaults(func=_handle_stream)
+
+    # List Devices Command
+    list_parser = subparsers.add_parser(
+        "devices", help="List all connected spectrometers"
+    )
+    list_parser.set_defaults(func=_handle_list_devices)
+
+    # Direct fallback options for root command
+    _add_device_args(parser)
+    return parser
+
+
+def _add_device_args(parser: argparse.ArgumentParser):
+    parser.add_argument(
+        "-d", "--device", type=str, default=None, help="Spectrometer serial number"
+    )
+    parser.add_argument(
+        "-i",
+        "--integration-time",
+        type=int,
+        default=100_000,
+        help="Integration time in µs (default: 100000)",
+    )
+    parser.add_argument(
+        "--mock", action="store_true", help="Force mock spectrometer simulator"
     )
 
 
-def _arm_interrupt_signals() -> None:
-    """Make SIGINT/SIGTERM raise KeyboardInterrupt.
-
-    Python at startup inherits SIGINT's disposition from the parent. If we
-    were launched in the background by a shell (e.g. `cmd &`), bash sets
-    SIGINT to SIG_IGN, and Python keeps it that way — so `kill -INT` would
-    silently do nothing. Re-arming guarantees that an external shutdown
-    request always reaches the streamer cleanup path.
-    """
-    signal.signal(signal.SIGINT, signal.default_int_handler)
-
-    def _term(_signum, _frame):
-        raise KeyboardInterrupt
-
-    signal.signal(signal.SIGTERM, _term)
+def _handle_list_devices(args: argparse.Namespace):
+    devices = SpectrometerDevice.list_available_devices()
+    print("\nAvailable Spectrometers:")
+    for d in devices:
+        kind = "SIMULATOR" if d["mock"] else "HARDWARE"
+        print(f"  • {d['label']} [{kind}]")
+    print()
 
 
-def _cmd_list(_args: argparse.Namespace) -> int:
-    devs = list_devices()
-    if not devs:
-        print("no spectrometers found (or `seabreeze` not installed)", file=sys.stderr)
-        return 1
-    for d in devs:
-        print(f"{d['serial']}\t{d['model']}")
-    return 0
-
-
-def _cmd_acquire(args: argparse.Namespace) -> int:
-    _arm_interrupt_signals()
-    device = open_device(serial=args.serial, mock=args.mock)
+def _handle_stream(args: argparse.Namespace):
+    dev = SpectrometerDevice(device_id=args.device, use_mock=args.mock)
+    dev.set_integration_time_micros(args.integration_time)
+    meta = dev.meta
+    print(
+        f"Streaming from {meta.model} ({meta.serial_number})... Press Ctrl+C to stop.\n"
+    )
     try:
-        device.set_integration_time(args.integration_us)
-        writer = _pick_writer(args.output)
-        with Streamer(device, [writer], max_frames=args.count) as s:
-            try:
-                s.wait()
-            except KeyboardInterrupt:
-                pass
-        print(
-            f"wrote {s.frame_count} frames to {args.output}",
-            file=sys.stderr,
-        )
-        return 0
-    finally:
-        device.close()
-
-
-def _cmd_stream(args: argparse.Namespace) -> int:
-    _arm_interrupt_signals()
-    device = open_device(serial=args.serial, mock=args.mock)
-    try:
-        device.set_integration_time(args.integration_us)
-        emitter = NdjsonStdoutEmitter()
-        with Streamer(device, [emitter], max_frames=args.max_frames) as s:
-            try:
-                s.wait()
-            except KeyboardInterrupt:
-                pass
-        return 0
-    finally:
-        device.close()
-
-
-def _cmd_view(args: argparse.Namespace) -> int:
-    import matplotlib.pyplot as plt
-
-    from seabreeze_live.consumers import MatplotlibLiveView
-
-    device = open_device(serial=args.serial, mock=args.mock)
-    try:
-        device.set_integration_time(args.integration_us)
-        view = MatplotlibLiveView(
-            refresh_ms=args.refresh_ms,
-            snapshot_dir=args.snapshot_dir,
-            snapshot_format=args.snapshot_format,
-        )
-        print(
-            f"snapshots will be saved to {view.snapshot_dir} "
-            f"(button or 's' key, format={args.snapshot_format})",
-            file=sys.stderr,
-        )
-        consumers = [view]
-        if args.save is not None:
-            consumers.append(_pick_writer(args.save))
-
-        prev_sigint = signal.getsignal(signal.SIGINT)
-        prev_sigterm = signal.getsignal(signal.SIGTERM)
-
-        def _shutdown(_signum, _frame):
-            # Closing all figures makes plt.show() return, so the `with`
-            # block can stop the streamer and close files cleanly.
-            plt.close("all")
-
-        signal.signal(signal.SIGINT, _shutdown)
-        signal.signal(signal.SIGTERM, _shutdown)
-        try:
-            with Streamer(device, consumers, max_frames=args.max_frames) as s:
-                view.run()
-        finally:
-            signal.signal(signal.SIGINT, prev_sigint)
-            signal.signal(signal.SIGTERM, prev_sigterm)
-        if args.save is not None:
+        while True:
+            intensities = dev.get_intensities()
+            wl = dev.get_wavelengths()
+            peak_idx = int(intensities.argmax())
             print(
-                f"wrote {s.frame_count} frames to {args.save}",
-                file=sys.stderr,
+                f"\rPeak: {wl[peak_idx]:.2f} nm | Counts: {intensities[peak_idx]:.1f} | Saturated: {bool(intensities.max() >= 65000)}",
+                end="",
             )
-        return 0
+            time.sleep(0.05)
+    except KeyboardInterrupt:
+        print("\nStreaming stopped.")
     finally:
-        device.close()
+        dev.close()
 
 
-def _cmd_serve(args: argparse.Namespace) -> int:
-    device = open_device(serial=args.serial, mock=args.mock)
-    server = RpcServer(device)
-    try:
-        server.emit_ready()
-        server.serve_forever()
-    finally:
-        # serve_forever() runs its own teardown on shutdown/EOF, but if it
-        # was interrupted before _teardown() ran (e.g. KeyboardInterrupt),
-        # this guarantees the device is closed.
-        try:
-            device.close()
-        except Exception:  # noqa: BLE001
-            pass
-    return 0
+def main():
+    parser = build_parser()
+    args = parser.parse_args()
 
-
-def main(argv: list[str] | None = None) -> int:
-    p = argparse.ArgumentParser(prog="seabreeze-live")
-    sub = p.add_subparsers(dest="cmd", required=True)
-
-    sub.add_parser("list", help="list connected spectrometers")
-
-    acq = sub.add_parser("acquire", help="capture N spectra to a file")
-    acq.add_argument("--count", type=int, required=True)
-    acq.add_argument("--integration-us", type=int, default=100_000)
-    acq.add_argument("--output", "-o", type=Path, required=True,
-                     help="output path; .h5/.hdf5 -> HDF5, .csv -> CSV")
-    acq.add_argument("--serial", default=None)
-    acq.add_argument("--mock", action="store_true")
-
-    strm = sub.add_parser("stream", help="emit spectra as NDJSON on stdout")
-    strm.add_argument("--integration-us", type=int, default=100_000)
-    strm.add_argument("--serial", default=None)
-    strm.add_argument("--mock", action="store_true")
-    strm.add_argument("--max-frames", type=int, default=None)
-
-    vw = sub.add_parser("view", help="live spectrum plot (matplotlib)")
-    vw.add_argument("--integration-us", type=int, default=100_000)
-    vw.add_argument("--serial", default=None)
-    vw.add_argument("--mock", action="store_true")
-    vw.add_argument("--max-frames", type=int, default=None)
-    vw.add_argument("--refresh-ms", type=int, default=50,
-                    help="plot refresh interval in ms (default 50)")
-    vw.add_argument("--save", type=Path, default=None,
-                    help="also record every frame to this file (.h5/.hdf5 or .csv)")
-    vw.add_argument("--snapshot-dir", type=Path, default=Path.cwd(),
-                    help="directory for button/keypress snapshots (default: CWD)")
-    vw.add_argument("--snapshot-format", choices=["csv", "h5"], default="csv",
-                    help="snapshot file format (default: csv)")
-
-    srv = sub.add_parser(
-        "serve",
-        help="run a line-delimited JSON-RPC server on stdin/stdout (Rust bridge)",
-    )
-    srv.add_argument("--serial", default=None)
-    srv.add_argument("--mock", action="store_true")
-
-    args = p.parse_args(argv)
-    handlers = {
-        "list": _cmd_list,
-        "acquire": _cmd_acquire,
-        "stream": _cmd_stream,
-        "view": _cmd_view,
-        "serve": _cmd_serve,
-    }
-    return handlers[args.cmd](args)
+    if args.command is None:
+        # Default behavior: run TUI
+        run_tui(
+            device=args.device,
+            integration_time_us=args.integration_time,
+            use_mock=args.mock,
+        )
+    else:
+        args.func(args)
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    main()
