@@ -251,7 +251,7 @@ class LiveSpectrometerApp(App):
                 [("CSV", "CSV"), ("HDF5", "HDF5")], value="CSV", id="select-rec-fmt"
             )
             yield Button("Start Recording (R)", id="btn-record", variant="primary")
-            yield Button("Export Snapshot (S)", id="btn-snapshot", variant="secondary")
+            yield Button("Export Snapshot (S)", id="btn-snapshot", variant="default")
 
         with Vertical(id="main-panel"):
             with Horizontal(id="metrics-bar"):
