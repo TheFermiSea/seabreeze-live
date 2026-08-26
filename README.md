@@ -7,14 +7,32 @@ The on-the-wire `SpectrumFrame` shape mirrors [rust-daq](https://github.com/) `S
 ## Install
 
 ```bash
-uv sync                          # core (mock + CSV + NDJSON only)
-uv sync --extra hdf5             # add HDF5 support
-uv sync --extra plot             # add live matplotlib viewer
-uv sync --extra hardware         # add the real seabreeze backend
-uv sync --extra hdf5 --extra plot --extra hardware --extra dev
+uv sync
 ```
 
-If you use the hardware extra, you'll also need the seabreeze udev rules / driver per the [seabreeze install docs](https://python-seabreeze.readthedocs.io/en/latest/install.html).
+For a real instrument, install the SeaBreeze USB driver and platform-specific
+permissions/rules described in the [python-seabreeze installation guide](https://python-seabreeze.readthedocs.io/en/latest/install.html).
+
+## Preparing a real spectrometer
+
+Start by discovering the instrument, then select it explicitly by serial number:
+
+```bash
+seabreeze-live devices
+seabreeze-live view --device USB2+F01234 --integration-time 100000
+```
+
+`--device` avoids accidentally attaching to the first available instrument
+when more than one is connected. Omitting it opens the first discovered device.
+The real-hardware path never falls back to the mock simulator: a missing
+SeaBreeze backend, inaccessible USB device, or invalid serial produces a clear
+connection error with next steps. Use `--mock` only when simulation is intended.
+
+At connection, the application reads and caches the wavelength axis, probes
+available lamp/shutter/temperature/EEPROM capabilities, reads the hardware
+integration-time limits, and clamps the configured integration time to that
+range. The device is closed on TUI exit, command termination, or context-manager
+exit.
 
 ## Quick start
 
@@ -38,26 +56,30 @@ with Streamer(device, [Hdf5Writer("run.h5"), NdjsonStdoutEmitter()],
 ## CLI
 
 ```bash
-seabreeze-live list                                       # connected devices
-seabreeze-live acquire --mock --count 100 -o run.h5       # capture to HDF5
-seabreeze-live acquire --count 50 -o run.csv              # capture to CSV
-seabreeze-live stream --mock --max-frames 100             # NDJSON on stdout
-seabreeze-live view --mock --integration-us 50000         # live plot
-seabreeze-live view --mock --save run.h5                  # live plot + record
+seabreeze-live devices                                  # enumerate devices
+seabreeze-live --mock                                   # launch the Textual TUI
+seabreeze-live view --mock --integration-time 50000     # launch the TUI
+seabreeze-live stream --mock --integration-time 50000   # headless peak monitor
+python -m seabreeze_live serve --mock                    # JSON-RPC bridge
 ```
 
-Output extension picks the writer: `.h5`/`.hdf5` → HDF5, `.csv` → CSV.
+The TUI supports CSV and HDF5 recording and CSV snapshots from its controls.
 
 ## Live visualization
 
-Requires the `[plot]` extra (matplotlib). Two equivalent ways:
+The default interactive experience is a Textual TUI, with live metrics,
+spectral-region selection, trace color/style controls, optical references,
+hardware corrections, and keyboard shortcuts. Plot updates are coalesced to
+12 Hz so terminal rendering cannot build an unbounded backlog while capture
+and recording proceed at the device rate.
 
-**CLI** — closing the window stops acquisition:
+**CLI**:
 ```bash
-seabreeze-live view --mock --integration-us 50000 --refresh-ms 50
+seabreeze-live view --mock --integration-time 50000
 ```
 
-**Programmatic** — compose the viewer with other consumers in one `Streamer`:
+**Programmatic** — compose the lightweight Matplotlib consumer with other
+stream consumers when a GUI plot is preferred:
 ```python
 from seabreeze_live import MockDevice, Streamer
 from seabreeze_live.consumers import Hdf5Writer, MatplotlibLiveView
@@ -65,7 +87,7 @@ from seabreeze_live.consumers import Hdf5Writer, MatplotlibLiveView
 device = MockDevice()
 device.set_integration_time(50_000)
 
-view = MatplotlibLiveView(refresh_ms=50)
+view = MatplotlibLiveView()
 streamer = Streamer(device, [view, Hdf5Writer("run.h5")])
 streamer.start()
 try:
@@ -74,7 +96,9 @@ finally:
     streamer.stop()    # also closes the HDF5 file
 ```
 
-Acquisition runs on the Streamer's background thread; `view.run()` must be called from the main thread (matplotlib GUI requirement). The view stores only the latest frame, so a slow display can't block acquisition — but any other consumer in the same Streamer (e.g. `Hdf5Writer`) does throttle the loop synchronously, which is what you want for not dropping data.
+Acquisition runs on the Streamer's background thread; `view.run()` must be
+called from the main thread. The view stores only the latest frame, so a slow
+display cannot block acquisition.
 
 ## HDF5 layout
 
@@ -88,7 +112,11 @@ Acquisition runs on the Streamer's background thread; `view.run()` must be calle
 root attrs: device_serial, value_units, axis_units, schema_version
 ```
 
-The file is opened in [SWMR](https://docs.h5py.org/en/stable/swmr.html) mode, so a separate process can open it read-only and tail the datasets while the writer is still running.
+The standalone `Hdf5Writer` opens files in
+[SWMR](https://docs.h5py.org/en/stable/swmr.html) mode and flushes each frame
+by default, so another process can tail the datasets while capture is active.
+For TUI recording, frames are written in batches of 64 to avoid a dataset
+resize and flush on every acquisition; pending frames are flushed on stop.
 
 ## NDJSON schema (Rust handoff)
 
@@ -163,7 +191,15 @@ Errors use the standard envelope:
                                   Emitter
 ```
 
-Consumers implement a two-method `Protocol` (`on_frame`, `close`) — the Streamer dispatches synchronously on its acquisition thread, so a slow consumer naturally throttles capture. Wrap in a queued forwarder if you need true decoupling.
+The Textual TUI uses the same consumer writers through `SpectrumRecorder`, so
+interactive and headless recordings have identical schemas. Pure acquisition
+averaging, boxcar smoothing, display transforms, and wavelength-region
+selection live in `seabreeze_live.processing` and are independently testable.
+
+Consumers implement a two-method `Protocol` (`on_frame`, `close`) — the
+Streamer dispatches synchronously on its acquisition thread, so a slow consumer
+naturally throttles capture. Wrap in a queued forwarder if you need true
+decoupling.
 
 ## Status
 
@@ -178,4 +214,6 @@ Single-device, software-timed acquisition only. The following are stubbed for fo
 uv run pytest
 ```
 
-The entire test suite runs against `MockDevice`; no hardware required.
+The complete test suite runs against `MockDevice`; no hardware is required.
+It covers acquisition, stream consumers, buffered HDF5 close behavior,
+snapshots, display processing, the JSON-RPC bridge, and TUI recording schema.

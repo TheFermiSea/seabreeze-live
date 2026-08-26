@@ -22,7 +22,9 @@ class Hdf5Writer:
 
     SCHEMA_VERSION = 1
 
-    def __init__(self, path: str | Path, *, chunk_size: int = 64) -> None:
+    def __init__(
+        self, path: str | Path, *, chunk_size: int = 64, flush_every: int = 1
+    ) -> None:
         try:
             import h5py
         except ImportError as e:
@@ -31,13 +33,17 @@ class Hdf5Writer:
             ) from e
         self._h5py = h5py
         self.path = Path(path)
+        if chunk_size < 1 or flush_every < 1:
+            raise ValueError("chunk_size and flush_every must be positive")
         self.chunk_size = chunk_size
+        self.flush_every = flush_every
         self._file: Any = None
         self._values_ds: Any = None
         self._ts_ds: Any = None
         self._fnum_ds: Any = None
         self._integ_ds: Any = None
         self._n_written = 0
+        self._pending: list[SpectrumFrame] = []
 
     def _ensure_open(self, frame: SpectrumFrame) -> None:
         if self._file is not None:
@@ -84,21 +90,30 @@ class Hdf5Writer:
 
     def on_frame(self, frame: SpectrumFrame) -> None:
         self._ensure_open(frame)
+        self._pending.append(frame)
+        if len(self._pending) >= self.flush_every:
+            self._flush_pending()
+
+    def _flush_pending(self) -> None:
+        if not self._pending:
+            return
         n = self._n_written
-        new_n = n + 1
-        self._values_ds.resize((new_n, frame.values.shape[0]))
-        self._values_ds[n] = frame.values
+        new_n = n + len(self._pending)
+        self._values_ds.resize((new_n, self._pending[0].values.shape[0]))
+        self._values_ds[n:new_n] = [frame.values for frame in self._pending]
         self._ts_ds.resize((new_n,))
-        self._ts_ds[n] = frame.timestamp_ns
+        self._ts_ds[n:new_n] = [frame.timestamp_ns for frame in self._pending]
         self._fnum_ds.resize((new_n,))
-        self._fnum_ds[n] = frame.frame_number
+        self._fnum_ds[n:new_n] = [frame.frame_number for frame in self._pending]
         self._integ_ds.resize((new_n,))
-        self._integ_ds[n] = frame.integration_time_us
+        self._integ_ds[n:new_n] = [frame.integration_time_us for frame in self._pending]
         for ds in (self._values_ds, self._ts_ds, self._fnum_ds, self._integ_ds):
             ds.flush()
         self._n_written = new_n
+        self._pending.clear()
 
     def close(self) -> None:
         if self._file is not None:
+            self._flush_pending()
             self._file.close()
             self._file = None

@@ -1,7 +1,8 @@
 import numpy as np
 import pytest
 
-from seabreeze_live import MockDevice, TriggerMode
+import seabreeze_live.device as device_module
+from seabreeze_live import HardwareConnectionError, MockDevice, TriggerMode
 
 
 def _fast_mock(**kwargs):
@@ -56,3 +57,64 @@ def test_seed_reproducibility():
     a = _fast_mock(seed=42).read_intensities()
     b = _fast_mock(seed=42).read_intensities()
     np.testing.assert_array_equal(a, b)
+
+
+class _FakeSpectrometer:
+    serial_number = "USB2+F01234"
+    model = "USB2000PLUS"
+    integration_time_micros_limits = (1_000, 20_000)
+
+    def __init__(self):
+        self.integration_time = None
+        self.last_intensity_kwargs = None
+        self.closed = False
+
+    @classmethod
+    def from_serial_number(cls, serial):
+        assert serial == cls.serial_number
+        return cls()
+
+    @classmethod
+    def from_first_available(cls):
+        return cls()
+
+    def wavelengths(self):
+        return np.array([400.0, 500.0, 600.0])
+
+    def integration_time_micros(self, value):
+        self.integration_time = value
+
+    def intensities(self, **kwargs):
+        self.last_intensity_kwargs = kwargs
+        return np.array([1.0, 2.0, 3.0])
+
+    def close(self):
+        self.closed = True
+
+
+def test_real_hardware_path_selects_serial_and_uses_seabreeze_keywords(monkeypatch):
+    backend = type("Backend", (), {"Spectrometer": _FakeSpectrometer})
+    monkeypatch.setattr(device_module, "SEABREEZE_AVAILABLE", True)
+    monkeypatch.setattr(device_module, "sb", backend)
+
+    with device_module.SpectrometerDevice(_FakeSpectrometer.serial_number) as device:
+        assert device.meta is not None and not device.meta.is_mock
+        assert device.integration_time_us == 20_000  # default clamped to limits
+        np.testing.assert_array_equal(device.get_wavelengths(), [400.0, 500.0, 600.0])
+        np.testing.assert_array_equal(
+            device.get_intensities(correct_dark_pixels=True), [1, 2, 3]
+        )
+        assert device.device.last_intensity_kwargs == {
+            "correct_dark_counts": True,
+            "correct_nonlinearity": False,
+        }
+        raw = device.device
+    assert raw.closed is True
+
+
+def test_real_hardware_never_silently_falls_back_to_mock(monkeypatch):
+    monkeypatch.setattr(device_module, "SEABREEZE_AVAILABLE", False)
+    with pytest.raises(
+        HardwareConnectionError, match="python-seabreeze is unavailable"
+    ):
+        device_module.SpectrometerDevice()

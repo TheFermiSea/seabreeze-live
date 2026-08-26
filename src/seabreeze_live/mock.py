@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import time
-from typing import Dict, Tuple
+
 import numpy as np
 
 
@@ -29,7 +29,7 @@ class MockSpectrometer:
     def __init__(self, serial_number: str = "MOCK-001", model: str = "Flame-S"):
         self.serial_number = serial_number
         self.model = model
-        self.integration_time_micros_limits: Tuple[int, int] = (1_000, 10_000_000)
+        self.integration_time_micros_limits: tuple[int, int] = (1_000, 10_000_000)
         self.current_integration_us: int = 100_000
         self._pixels: int = 2048
         self._wavelengths: np.ndarray = np.linspace(350.0, 1000.0, self._pixels)
@@ -48,7 +48,7 @@ class MockSpectrometer:
     def trigger_mode(self, mode: int):
         self._trigger_mode = mode
 
-    def get_temperatures(self) -> Dict[str, float]:
+    def get_temperatures(self) -> dict[str, float]:
         t = time.time()
         return {
             "Detector": round(22.5 + 0.8 * np.sin(t / 15.0), 2),
@@ -95,3 +95,71 @@ class MockSpectrometer:
 
     def close(self):
         pass
+
+
+class MockDevice:
+    """Protocol-compatible synthetic device retained for library users and tests."""
+
+    def __init__(
+        self,
+        *,
+        pixels: int = 2048,
+        wavelength_range_nm: tuple[float, float] = (200.0, 1100.0),
+        n_peaks: int = 3,
+        noise_sigma: float = 5.0,
+        max_intensity: float = 65535.0,
+        seed: int = 0,
+        simulate_exposure: bool = True,
+    ) -> None:
+        self.serial_number = f"MOCK{seed:06d}"
+        self.model = "MockSpectrometer"
+        self.pixels = pixels
+        self.max_intensity = max_intensity
+        self.integration_time_limits_us = (1_000, 10_000_000)
+        self.integration_time_us = 100_000
+        self._wavelengths = np.linspace(*wavelength_range_nm, pixels)
+        self._rng = np.random.default_rng(seed)
+        low, high = wavelength_range_nm
+        self._peak_centers = self._rng.uniform(low + 50, high - 50, n_peaks)
+        self._peak_amps = self._rng.uniform(5_000, 30_000, n_peaks)
+        self._peak_widths = self._rng.uniform(2.0, 10.0, n_peaks)
+        self._noise_sigma = noise_sigma
+        self._simulate_exposure = simulate_exposure
+        self._closed = False
+
+    def set_integration_time(self, microseconds: int) -> None:
+        lower, upper = self.integration_time_limits_us
+        if not lower <= microseconds <= upper:
+            raise ValueError(
+                f"integration_time {microseconds} us outside mock limits [{lower}, {upper}]"
+            )
+        self.integration_time_us = microseconds
+
+    def set_trigger_mode(self, mode: object) -> None:
+        if int(mode) != 0:
+            raise NotImplementedError("MockDevice only supports TriggerMode.NORMAL")
+
+    def wavelengths(self) -> np.ndarray:
+        return self._wavelengths.copy()
+
+    def read_intensities(
+        self, correct_dark: bool = False, correct_nonlinearity: bool = False
+    ) -> np.ndarray:
+        if self._simulate_exposure:
+            time.sleep(self.integration_time_us / 1_000_000)
+        scale = min(1.0, self.integration_time_us / 1_000_000)
+        signal = np.zeros(self.pixels)
+        for center, amplitude, width in zip(
+            self._peak_centers, self._peak_amps, self._peak_widths
+        ):
+            signal += amplitude * np.exp(
+                -0.5 * ((self._wavelengths - center) / width) ** 2
+            )
+        signal *= scale
+        signal += self._rng.normal(0.0, self._noise_sigma, self.pixels)
+        if correct_dark:
+            signal -= 50.0
+        return np.clip(signal, 0.0, self.max_intensity)
+
+    def close(self) -> None:
+        self._closed = True

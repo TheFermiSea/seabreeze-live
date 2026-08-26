@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from enum import IntEnum
-from typing import Any, Dict, List, Optional
+from typing import Any, Self
+
 import numpy as np
 
 try:
@@ -16,12 +18,19 @@ except ImportError:
 
 from seabreeze_live.mock import MockSpectrometer
 
+logger = logging.getLogger(__name__)
+
 
 class TriggerMode(IntEnum):
     NORMAL = 0
     SOFTWARE = 1
     EXTERNAL_SYNC = 2
     EXTERNAL_HARDWARE = 3
+    EXTERNAL_HARDWARE_EDGE = 3
+
+
+class HardwareConnectionError(RuntimeError):
+    """A real spectrometer could not be discovered or opened."""
 
 
 @dataclass
@@ -41,10 +50,11 @@ class DeviceMetadata:
 class SpectrometerDevice:
     """Unified wrapper around physical SeaBreeze and Mock spectrometers."""
 
-    def __init__(self, device_id: Optional[str] = None, use_mock: bool = False):
+    def __init__(self, device_id: str | None = None, use_mock: bool = False):
         self.device: Any = None
-        self.meta: Optional[DeviceMetadata] = None
-        self._wavelengths: Optional[np.ndarray] = None
+        self.meta: DeviceMetadata | None = None
+        self._wavelengths: np.ndarray | None = None
+        self._integration_time_us = 100_000
         self.open(device_id, use_mock=use_mock)
 
     @property
@@ -55,10 +65,26 @@ class SpectrometerDevice:
     def model(self) -> str:
         return self.meta.model if self.meta else ""
 
+    @property
+    def pixels(self) -> int:
+        return self.meta.pixels if self.meta else 0
+
+    @property
+    def integration_time_limits_us(self) -> tuple[int, int]:
+        if self.meta is None:
+            return (0, 0)
+        return (self.meta.min_integration_us, self.meta.max_integration_us)
+
+    @property
+    def integration_time_us(self) -> int:
+        if self.device is not None and hasattr(self.device, "current_integration_us"):
+            return int(self.device.current_integration_us)
+        return self._integration_time_us
+
     @staticmethod
-    def list_available_devices() -> List[Dict[str, Any]]:
-        """List all connected spectrometers and the mock simulator."""
-        devices: List[Dict[str, Any]] = []
+    def list_available_devices() -> list[dict[str, Any]]:
+        """List discoverable hardware plus the explicit mock simulator option."""
+        devices: list[dict[str, Any]] = []
         if SEABREEZE_AVAILABLE:
             try:
                 for dev in sb.list_devices():
@@ -70,8 +96,10 @@ class SpectrometerDevice:
                             "mock": False,
                         }
                     )
-            except Exception:
-                pass
+            except Exception as error:
+                # Discovery must never make the TUI unusable; opening a real
+                # device still raises a visible HardwareConnectionError.
+                logger.debug("SeaBreeze device discovery failed", exc_info=error)
 
         devices.append(
             {
@@ -84,11 +112,11 @@ class SpectrometerDevice:
         return devices
 
     def open(
-        self, device_id: Optional[str] = None, use_mock: bool = False
+        self, device_id: str | None = None, use_mock: bool = False
     ) -> DeviceMetadata:
         self.close()
 
-        if use_mock or device_id == "MOCK-SIMULATOR" or not SEABREEZE_AVAILABLE:
+        if use_mock or device_id == "MOCK-SIMULATOR":
             self.device = MockSpectrometer()
             min_t, max_t = self.device.integration_time_micros_limits
             self._wavelengths = self.device.wavelengths()
@@ -104,15 +132,37 @@ class SpectrometerDevice:
                 has_eeprom=True,
                 is_mock=True,
             )
+            self.set_integration_time_micros(self._integration_time_us)
             return self.meta
 
-        if device_id:
-            self.device = sb.Spectrometer.from_serial_number(device_id)
-        else:
-            self.device = sb.Spectrometer.from_first_available()
+        if not SEABREEZE_AVAILABLE:
+            raise HardwareConnectionError(
+                "python-seabreeze is unavailable; install it and its USB backend, "
+                "or pass --mock to use the simulator"
+            )
 
-        min_t, max_t = self.device.integration_time_micros_limits
-        self._wavelengths = self.device.wavelengths()
+        try:
+            if device_id:
+                self.device = sb.Spectrometer.from_serial_number(device_id)
+            else:
+                self.device = sb.Spectrometer.from_first_available()
+        except Exception as error:
+            target = (
+                f"serial {device_id!r}" if device_id else "the first available device"
+            )
+            raise HardwareConnectionError(
+                f"could not open {target}; run `seabreeze-live devices` to verify "
+                "discovery, then check the USB cable, permissions, and SeaBreeze driver"
+            ) from error
+
+        try:
+            min_t, max_t = self.device.integration_time_micros_limits
+            self._wavelengths = np.asarray(self.device.wavelengths(), dtype=np.float64)
+        except Exception as error:
+            self.close()
+            raise HardwareConnectionError(
+                "device opened but could not read integration-time limits or wavelengths"
+            ) from error
 
         has_lamp = hasattr(self.device, "lamp") and self.device.lamp is not None
         has_shutter = (
@@ -133,14 +183,23 @@ class SpectrometerDevice:
             has_eeprom=has_eeprom,
             is_mock=False,
         )
+        # A requested setting is applied only after limits are known. Clamp to
+        # the hardware range rather than leaving an unknown driver default.
+        self.set_integration_time_micros(self._integration_time_us)
         return self.meta
+
+    def __enter__(self) -> Self:
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self.close()
 
     def close(self):
         if self.device is not None:
             try:
                 self.device.close()
-            except Exception:
-                pass
+            except Exception as error:
+                logger.debug("SeaBreeze device close failed", exc_info=error)
             self.device = None
             self.meta = None
             self._wavelengths = None
@@ -163,8 +222,21 @@ class SpectrometerDevice:
     ) -> np.ndarray:
         if self.device is None:
             return np.zeros(2048, dtype=np.float64)
-        return self.device.intensities(
-            correct_dark_pixels=correct_dark_pixels,
+        kwargs = {"correct_nonlinearity": correct_nonlinearity}
+        if self.meta is not None and self.meta.is_mock:
+            kwargs["correct_dark_pixels"] = correct_dark_pixels
+        else:
+            # python-seabreeze calls this hardware correction
+            # ``correct_dark_counts`` rather than ``correct_dark_pixels``.
+            kwargs["correct_dark_counts"] = correct_dark_pixels
+        return np.asarray(self.device.intensities(**kwargs), dtype=np.float64)
+
+    def read_intensities(
+        self, correct_dark: bool = False, correct_nonlinearity: bool = False
+    ) -> np.ndarray:
+        """Compatibility spelling used by the acquisition and RPC APIs."""
+        return self.get_intensities(
+            correct_dark_pixels=correct_dark,
             correct_nonlinearity=correct_nonlinearity,
         )
 
@@ -185,8 +257,12 @@ class SpectrometerDevice:
                 min(integration_time_us, self.meta.max_integration_us),
             )
             self.device.integration_time_micros(clamped)
+            self._integration_time_us = clamped
             return clamped
         return integration_time_us
+
+    def set_integration_time(self, microseconds: int) -> int:
+        return self.set_integration_time_micros(microseconds)
 
     def integration_time_micros(self, us: int) -> int:
         return self.set_integration_time_micros(us)
@@ -196,8 +272,8 @@ class SpectrometerDevice:
         if self.device is not None and hasattr(self.device, "trigger_mode"):
             try:
                 self.device.trigger_mode(val)
-            except Exception:
-                pass
+            except Exception as error:
+                logger.debug("Could not set trigger mode", exc_info=error)
 
     def trigger_mode(self, mode: int | TriggerMode):
         self.set_trigger_mode(mode)
@@ -210,8 +286,8 @@ class SpectrometerDevice:
         ):
             try:
                 self.device.lamp.set_lamp_enable(state)
-            except Exception:
-                pass
+            except Exception as error:
+                logger.debug("Could not set lamp state", exc_info=error)
 
     def set_shutter_open(self, state: bool):
         if (
@@ -221,11 +297,11 @@ class SpectrometerDevice:
         ):
             try:
                 self.device.shutter.set_shutter_open(state)
-            except Exception:
-                pass
+            except Exception as error:
+                logger.debug("Could not set shutter state", exc_info=error)
 
-    def read_temperatures(self) -> Dict[str, float]:
-        temps: Dict[str, float] = {}
+    def read_temperatures(self) -> dict[str, float]:
+        temps: dict[str, float] = {}
         if self.device is None:
             return temps
         if self.meta and self.meta.is_mock:
@@ -235,16 +311,16 @@ class SpectrometerDevice:
                 raw = self.device.f.temperature.get_temperatures()
                 for i, t in enumerate(raw):
                     temps[f"Sensor {i}"] = float(t)
-            except Exception:
-                pass
+            except Exception as error:
+                logger.debug("Could not read temperatures", exc_info=error)
         return temps
 
     def read_eeprom_slot(self, slot_index: int) -> str:
         if self.device is not None and self.meta and self.meta.has_eeprom:
             try:
                 return str(self.device.f.eeprom.read_eeprom_slot(slot_index))
-            except Exception:
-                pass
+            except Exception as error:
+                logger.debug("Could not read EEPROM slot", exc_info=error)
         return ""
 
 
@@ -253,7 +329,7 @@ SeabreezeDevice = SpectrometerDevice
 
 
 def open_device(
-    serial_number: Optional[str] = None,
+    serial_number: str | None = None,
     mock: bool = False,
     use_mock: bool = False,
 ) -> SpectrometerDevice:
@@ -261,6 +337,6 @@ def open_device(
     return SpectrometerDevice(device_id=serial_number, use_mock=(mock or use_mock))
 
 
-def list_devices() -> List[Dict[str, Any]]:
+def list_devices() -> list[dict[str, Any]]:
     """Module-level alias for enumerating devices."""
     return SpectrometerDevice.list_available_devices()

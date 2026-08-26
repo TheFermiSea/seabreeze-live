@@ -52,6 +52,17 @@ def test_hdf5_roundtrip(tmp_path):
         np.testing.assert_array_equal(f["wavelengths"][:], d.wavelengths())
 
 
+def test_hdf5_writer_flushes_buffer_when_closed(tmp_path):
+    import h5py
+
+    out = tmp_path / "buffered.h5"
+    d = _fast_mock()
+    with Streamer(d, [Hdf5Writer(out, flush_every=64)], max_frames=3) as s:
+        s.wait(timeout=5.0)
+    with h5py.File(out, "r") as f:
+        assert f["intensities"].shape == (3, d.pixels)
+
+
 def test_ndjson_emitter_schema():
     buf = io.StringIO()
     emitter = NdjsonStdoutEmitter(stream=buf)

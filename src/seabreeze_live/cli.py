@@ -1,12 +1,12 @@
 """Command line interface routing TUI, CLI streaming, snapshot, and RPC modes."""
 
 import argparse
-import sys
 import time
-from typing import Optional
 
 from seabreeze_live.consumers.live_view import run_tui
-from seabreeze_live.device import SpectrometerDevice
+from seabreeze_live.device import HardwareConnectionError, SpectrometerDevice
+from seabreeze_live.mock import MockDevice
+from seabreeze_live.rpc import RpcServer
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -40,6 +40,13 @@ def build_parser() -> argparse.ArgumentParser:
         "devices", help="List all connected spectrometers"
     )
     list_parser.set_defaults(func=_handle_list_devices)
+
+    serve_parser = subparsers.add_parser("serve", help="Run the JSON-RPC device bridge")
+    serve_parser.add_argument(
+        "--mock", action="store_true", help="Use the mock spectrometer"
+    )
+    serve_parser.add_argument("-d", "--device", type=str, default=None)
+    serve_parser.set_defaults(func=_handle_serve)
 
     # Direct fallback options for root command
     _add_device_args(parser)
@@ -94,19 +101,32 @@ def _handle_stream(args: argparse.Namespace):
         dev.close()
 
 
+def _handle_serve(args: argparse.Namespace) -> None:
+    device = MockDevice() if args.mock else SpectrometerDevice(device_id=args.device)
+    server = RpcServer(device)
+    try:
+        server.emit_ready()
+        server.serve_forever()
+    finally:
+        device.close()
+
+
 def main():
     parser = build_parser()
     args = parser.parse_args()
 
-    if args.command is None:
-        # Default behavior: run TUI
-        run_tui(
-            device=args.device,
-            integration_time_us=args.integration_time,
-            use_mock=args.mock,
-        )
-    else:
-        args.func(args)
+    try:
+        if args.command is None:
+            # Default behavior: run TUI
+            run_tui(
+                device=args.device,
+                integration_time_us=args.integration_time,
+                use_mock=args.mock,
+            )
+        else:
+            args.func(args)
+    except HardwareConnectionError as error:
+        parser.error(str(error))
 
 
 if __name__ == "__main__":
