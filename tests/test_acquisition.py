@@ -1,6 +1,16 @@
+import time
+
 import pytest
 
-from seabreeze_live import MockDevice, SpectrumFrame, Streamer, acquire
+from seabreeze_live import (
+    Acquirer,
+    AcquisitionSettings,
+    MockDevice,
+    Spectrometer,
+    SpectrumFrame,
+    Streamer,
+    acquire,
+)
 
 
 def _fast_mock(**kwargs):
@@ -30,6 +40,29 @@ def test_acquire_applies_integration_time_override():
     d = _fast_mock()
     acquire(d, count=1, integration_time_us=250_000)
     assert d.integration_time_us == 250_000
+
+
+def test_mock_satisfies_structural_device_contract():
+    assert isinstance(_fast_mock(), Spectrometer)
+
+
+def test_acquirer_applies_processing_and_preserves_frame_contract():
+    d = _fast_mock(seed=8, noise_sigma=0)
+    acquirer = Acquirer(d, AcquisitionSettings(scans_to_average=2, boxcar_width=2))
+    frame = acquirer.capture()
+    assert frame.frame_number == 0
+    assert frame.values.shape == frame.axis.shape == (d.pixels,)
+    assert frame.values.dtype.name == "float64"
+    assert frame.axis.flags.writeable is False
+
+
+def test_acquirer_rejects_shape_mismatch():
+    class BadShape(MockDevice):
+        def read_intensities(self, *args, **kwargs):
+            return super().read_intensities(*args, **kwargs)[:-1]
+
+    with pytest.raises(ValueError, match="does not match wavelength axis"):
+        Acquirer(BadShape(simulate_exposure=False)).capture()
 
 
 def test_acquire_zero_count_rejected():
@@ -95,6 +128,28 @@ def test_streamer_add_consumer_rejected_while_running():
             s.add_consumer(_Collector())
     finally:
         s.stop()
+
+
+def test_streamer_pause_and_resume():
+    d = MockDevice(simulate_exposure=True)
+    d.set_integration_time(1_000)
+    collector = _Collector()
+    s = Streamer(d, [collector])
+    s.start()
+    deadline = time.monotonic() + 2
+    while len(collector.frames) < 2 and time.monotonic() < deadline:
+        time.sleep(0.001)
+    assert len(collector.frames) >= 2
+    s.pause()
+    paused_at = len(collector.frames)
+    time.sleep(0.03)
+    assert len(collector.frames) <= paused_at + 1
+    s.resume()
+    deadline = time.monotonic() + 2
+    while len(collector.frames) <= paused_at + 1 and time.monotonic() < deadline:
+        time.sleep(0.001)
+    assert len(collector.frames) > paused_at + 1
+    s.stop()
 
 
 def test_streamer_propagates_consumer_exception():

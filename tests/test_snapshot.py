@@ -1,4 +1,5 @@
 import re
+from typing import Any
 
 import numpy as np
 import pytest
@@ -41,7 +42,8 @@ def test_csv_snapshot_metadata_and_data(tmp_path):
     assert "wavelength_nm,intensity" in text
 
     data_lines = [
-        ln for ln in text.splitlines()
+        ln
+        for ln in text.splitlines()
         if ln and not ln.startswith("#") and not ln.startswith("wavelength_nm")
     ]
     assert len(data_lines) == d.pixels
@@ -58,7 +60,8 @@ def test_hdf5_snapshot_attrs_and_datasets(tmp_path):
     path = save_snapshot(frame, tmp_path, "h5")
 
     assert path.suffix == ".h5"
-    with h5py.File(path, "r") as f:
+    with h5py.File(path, "r") as h5_file:
+        f: Any = h5_file
         assert f["wavelengths"].shape == (d.pixels,)
         assert f["intensities"].shape == (d.pixels,)
         np.testing.assert_array_equal(f["wavelengths"][:], frame.axis)
@@ -111,6 +114,7 @@ def test_save_snapshot_now_each_call_makes_a_new_file(tmp_path):
 
 def test_save_snapshot_now_writes_png_when_figure_attached(tmp_path):
     import matplotlib
+
     matplotlib.use("Agg", force=True)
     import matplotlib.pyplot as plt
 

@@ -1,6 +1,7 @@
 import csv as csv_mod
 import io
 import json
+from typing import Any
 
 import numpy as np
 import pytest
@@ -37,7 +38,8 @@ def test_hdf5_roundtrip(tmp_path):
     with Streamer(d, [Hdf5Writer(out)], max_frames=6) as s:
         s.wait(timeout=5.0)
 
-    with h5py.File(out, "r") as f:
+    with h5py.File(out, "r") as h5_file:
+        f: Any = h5_file
         assert f["intensities"].shape == (6, d.pixels)
         assert f["wavelengths"].shape == (d.pixels,)
         assert f["timestamp_ns"].shape == (6,)
@@ -50,6 +52,18 @@ def test_hdf5_roundtrip(tmp_path):
         assert int(f.attrs["schema_version"]) == Hdf5Writer.SCHEMA_VERSION
         # Wavelengths match what the device produced.
         np.testing.assert_array_equal(f["wavelengths"][:], d.wavelengths())
+
+
+def test_hdf5_writer_flushes_buffer_when_closed(tmp_path):
+    import h5py
+
+    out = tmp_path / "buffered.h5"
+    d = _fast_mock()
+    with Streamer(d, [Hdf5Writer(out, flush_every=64)], max_frames=3) as s:
+        s.wait(timeout=5.0)
+    with h5py.File(out, "r") as h5_file:
+        f: Any = h5_file
+        assert f["intensities"].shape == (3, d.pixels)
 
 
 def test_ndjson_emitter_schema():
@@ -71,6 +85,18 @@ def test_ndjson_emitter_schema():
         assert len(obj["values"]) == d.pixels
         assert len(obj["axis"]) == d.pixels
         assert isinstance(obj["timestamp_ns"], int)
+
+
+def test_compact_ndjson_matches_rust_event_contract():
+    buf = io.StringIO()
+    emitter = NdjsonStdoutEmitter(stream=buf, include_context=False)
+    d = _fast_mock()
+    with Streamer(d, [emitter], max_frames=1) as streamer:
+        streamer.wait(timeout=5.0)
+
+    event = json.loads(buf.getvalue())
+    assert set(event) == {"timestamp_ns", "integration_time_us", "values"}
+    assert len(event["values"]) == d.pixels
 
 
 def test_hdf5_writer_requires_h5py(monkeypatch):

@@ -1,20 +1,42 @@
 # seabreeze-live
 
-A live acquisition wrapper around [python-seabreeze](https://python-seabreeze.readthedocs.io/) for Ocean Optics spectrometers. Layered API (blocking `acquire()` + threaded `Streamer`), pluggable consumers (HDF5/CSV/NDJSON), and a `MockDevice` so you can develop and test off-hardware.
+A live acquisition service around [python-seabreeze](https://python-seabreeze.readthedocs.io/) for Ocean Optics spectrometers. It provides a transport-neutral Python acquisition core, pluggable HDF5/CSV/NDJSON consumers, an interactive TUI, and the stdio protocol used by rust-daq's existing `driver-seabreeze` crate.
 
-The on-the-wire `SpectrumFrame` shape mirrors [rust-daq](https://github.com/) `SpectrumData` (`values`/`axis`/`*_units` + capture metadata) so a future native Rust driver can map 1:1.
+The core `SpectrumFrame` maps directly to rust-daq's `SpectrumData`. The Rust bridge caches the wavelength axis during startup and receives compact frames containing only `timestamp_ns`, `integration_time_us`, and `values`.
 
 ## Install
 
 ```bash
-uv sync                          # core (mock + CSV + NDJSON only)
-uv sync --extra hdf5             # add HDF5 support
-uv sync --extra plot             # add live matplotlib viewer
-uv sync --extra hardware         # add the real seabreeze backend
-uv sync --extra hdf5 --extra plot --extra hardware --extra dev
+uv sync --extra ui --extra hdf5
 ```
 
-If you use the hardware extra, you'll also need the seabreeze udev rules / driver per the [seabreeze install docs](https://python-seabreeze.readthedocs.io/en/latest/install.html).
+For a headless rust-daq bridge, the base installation is sufficient. The UI,
+Matplotlib view, and HDF5 support are separate `ui`, `plot`, and `hdf5` extras,
+so a daemon host does not need to install graphical or storage dependencies.
+
+For a real instrument, install the SeaBreeze USB driver and platform-specific
+permissions/rules described in the [python-seabreeze installation guide](https://python-seabreeze.readthedocs.io/en/latest/install.html).
+
+## Preparing a real spectrometer
+
+Start by discovering the instrument, then select it explicitly by serial number:
+
+```bash
+seabreeze-live devices
+seabreeze-live view --serial USB2+F01234 --integration-time 100000
+```
+
+`--serial` (also accepted as `--device`) avoids accidentally attaching to the first available instrument
+when more than one is connected. Omitting it opens the first discovered device.
+The real-hardware path never falls back to the mock simulator: a missing
+SeaBreeze backend, inaccessible USB device, or invalid serial produces a clear
+connection error with next steps. Use `--mock` only when simulation is intended.
+
+At connection, the application reads and caches the wavelength axis, probes
+available lamp/shutter/temperature/EEPROM capabilities, reads the hardware
+integration-time limits, and clamps the configured integration time to that
+range. The device is closed on TUI exit, command termination, or context-manager
+exit.
 
 ## Quick start
 
@@ -38,26 +60,32 @@ with Streamer(device, [Hdf5Writer("run.h5"), NdjsonStdoutEmitter()],
 ## CLI
 
 ```bash
-seabreeze-live list                                       # connected devices
-seabreeze-live acquire --mock --count 100 -o run.h5       # capture to HDF5
-seabreeze-live acquire --count 50 -o run.csv              # capture to CSV
-seabreeze-live stream --mock --max-frames 100             # NDJSON on stdout
-seabreeze-live view --mock --integration-us 50000         # live plot
-seabreeze-live view --mock --save run.h5                  # live plot + record
+seabreeze-live devices                                  # enumerate devices
+seabreeze-live --mock                                   # launch the Textual TUI
+seabreeze-live view --mock --integration-time 50000     # launch the TUI
+seabreeze-live stream --mock --integration-time 50000   # headless peak monitor
+python -m seabreeze_live serve --mock                    # JSON-RPC bridge
 ```
 
-Output extension picks the writer: `.h5`/`.hdf5` → HDF5, `.csv` → CSV.
+The TUI supports CSV and HDF5 recording and CSV snapshots from its controls.
+It writes them under `spectra/` by default rather than cluttering the working
+directory.
 
 ## Live visualization
 
-Requires the `[plot]` extra (matplotlib). Two equivalent ways:
+The default interactive experience is a Textual TUI, with live metrics,
+spectral-region selection, trace color/style controls, optical references,
+hardware corrections, and keyboard shortcuts. Plot updates are coalesced to
+12 Hz so terminal rendering cannot build an unbounded backlog while capture
+and recording proceed at the device rate.
 
-**CLI** — closing the window stops acquisition:
+**CLI**:
 ```bash
-seabreeze-live view --mock --integration-us 50000 --refresh-ms 50
+seabreeze-live view --mock --integration-time 50000
 ```
 
-**Programmatic** — compose the viewer with other consumers in one `Streamer`:
+**Programmatic** — compose the lightweight Matplotlib consumer with other
+stream consumers when a GUI plot is preferred:
 ```python
 from seabreeze_live import MockDevice, Streamer
 from seabreeze_live.consumers import Hdf5Writer, MatplotlibLiveView
@@ -65,7 +93,7 @@ from seabreeze_live.consumers import Hdf5Writer, MatplotlibLiveView
 device = MockDevice()
 device.set_integration_time(50_000)
 
-view = MatplotlibLiveView(refresh_ms=50)
+view = MatplotlibLiveView()
 streamer = Streamer(device, [view, Hdf5Writer("run.h5")])
 streamer.start()
 try:
@@ -74,7 +102,9 @@ finally:
     streamer.stop()    # also closes the HDF5 file
 ```
 
-Acquisition runs on the Streamer's background thread; `view.run()` must be called from the main thread (matplotlib GUI requirement). The view stores only the latest frame, so a slow display can't block acquisition — but any other consumer in the same Streamer (e.g. `Hdf5Writer`) does throttle the loop synchronously, which is what you want for not dropping data.
+Acquisition runs on the Streamer's background thread; `view.run()` must be
+called from the main thread. The view stores only the latest frame, so a slow
+display cannot block acquisition.
 
 ## HDF5 layout
 
@@ -88,7 +118,11 @@ Acquisition runs on the Streamer's background thread; `view.run()` must be calle
 root attrs: device_serial, value_units, axis_units, schema_version
 ```
 
-The file is opened in [SWMR](https://docs.h5py.org/en/stable/swmr.html) mode, so a separate process can open it read-only and tail the datasets while the writer is still running.
+The standalone `Hdf5Writer` opens files in
+[SWMR](https://docs.h5py.org/en/stable/swmr.html) mode and flushes each frame
+by default, so another process can tail the datasets while capture is active.
+For TUI recording, frames are written in batches of 64 to avoid a dataset
+resize and flush on every acquisition; pending frames are flushed on stop.
 
 ## NDJSON schema (Rust handoff)
 
@@ -101,11 +135,15 @@ One JSON object per line on stdout, fixed envelope:
  "values":[…],"axis":[…]}
 ```
 
-A Rust parent process (e.g. a future `crates/driver-seabreeze` in rust-daq that spawns this CLI) can read `stdout` line-by-line and map each object to `SpectrumData` directly.
+This full envelope is emitted by the standalone `stream --format ndjson`
+command. The rust-daq service path uses the compact event described below.
 
 ## JSON-RPC stdio protocol (Rust bridge)
 
-For tighter integration with a Rust parent (e.g. `crates/driver-seabreeze` in rust-daq), the `serve` subcommand replaces the implicit lifecycle of `stream`: the parent opens the spectrometer once, drives it via line-delimited JSON-RPC 2.0 on `stdin`, and reads spectrum frames + RPC responses from `stdout`.
+The `serve` subcommand is the subprocess entry point used by rust-daq's
+`driver-seabreeze` crate. The parent opens the spectrometer once, drives it via
+line-delimited JSON-RPC 2.0 on `stdin`, and reads compact spectrum frames plus
+RPC responses from `stdout`.
 
 ```bash
 python -m seabreeze_live serve --mock
@@ -114,24 +152,36 @@ python -m seabreeze_live serve --mock
 On startup the server writes one banner line:
 
 ```json
-{"jsonrpc":"2.0","ready":true,"device":{"model":"MockSpectrometer","serial":"MOCK000000","pixel_count":2048,"integration_time_limits_us":[1000,10000000]}}
+{"jsonrpc":"2.0","ready":true,"protocol_version":"1.0","device":{"model":"MockSpectrometer","serial":"MOCK000000","pixel_count":2048,"integration_time_limits_us":[1000,10000000]}}
 ```
 
-Then it reads one JSON-RPC request per `stdin` line and writes exactly one JSON line per response. While streaming, NDJSON spectrum frames (same schema as `seabreeze-live stream`) interleave with RPC responses on `stdout`.
+Then it reads one JSON-RPC request per `stdin` line and writes exactly one JSON
+line per response. While streaming, compact spectrum events interleave with RPC
+responses on `stdout`:
 
-**Discriminator:** RPC responses always carry `"jsonrpc": "2.0"`. NDJSON spectrum frames never carry that key — they always carry `"type": "spectrum"`. A Rust parent should branch on the presence of `jsonrpc` before parsing.
+```json
+{"timestamp_ns":1715520000000000000,"integration_time_us":100000,"values":[…]}
+```
+
+The axis is fetched once with `get_wavelengths`. Avoiding its repetition cuts
+the dominant steady-state subprocess serialization and pipe overhead roughly in
+half for typical devices.
+
+**Discriminator:** RPC responses always carry `"jsonrpc": "2.0"`. Spectrum
+events never carry that key. A Rust parent branches on the presence of
+`jsonrpc` before parsing, exactly as `driver-seabreeze` does.
 
 ### Methods
 
 | Method | Params | Result |
 |---|---|---|
-| `set_integration_time_us` | `{value: int}` | `{ok: true}` |
-| `set_trigger_mode` | `{mode: "NORMAL"\|...}` | `{ok: true}` — non-`NORMAL` modes return a JSON-RPC error on the mock |
+| `set_integration_time_us` | `{value: int}` | `null` |
+| `set_trigger_mode` | `{mode: "NORMAL"\|...}` | `null` — non-`NORMAL` modes return a JSON-RPC error on the mock |
 | `get_wavelengths` | `{}` | `[float, ...]` (length = `pixel_count`) |
 | `get_device_info` | `{}` | `{model, serial, pixel_count, integration_time_limits_us: [int, int]}` |
-| `start_stream` | `{integration_time_us?: int}` | `{ok: true}` — begins emitting NDJSON spectrum frames on stdout |
-| `stop_stream` | `{}` | `{ok: true}` (or `{ok: true, was_running: false}`) |
-| `shutdown` | `{}` | `{ok: true}` — server stops the stream, closes the device, exits 0 |
+| `start_stream` | `{integration_time_us?: int}` | `null` — begins emitting compact spectrum events |
+| `stop_stream` | `{}` | `null` |
+| `shutdown` | `{}` | `null` — server stops the stream, closes the device, exits 0 |
 
 Errors use the standard envelope:
 
@@ -148,13 +198,14 @@ Errors use the standard envelope:
 
 ```
                 ┌──────────────┐
-                │   device     │   SeabreezeDevice (hardware)
-                │   (Protocol) │   MockDevice       (synthetic)
+                │ Spectrometer │   structural Protocol
+                │   device     │   SeaBreeze adapter / one MockDevice
                 └──────┬───────┘
-                       │ frames (NDArray)
+                       │ synchronized device I/O
                 ┌──────▼───────┐
-                │  acquire()   │   blocking, returns list[SpectrumFrame]
-                │  Streamer    │   threaded, push to consumers
+                │   Acquirer   │   validates and constructs SpectrumFrame
+                │ acquire/     │   blocking and threaded front ends
+                │ Streamer     │
                 └──────┬───────┘
                        │ SpectrumFrame
         ┌──────────────┼──────────────┬──────────────┐
@@ -163,14 +214,25 @@ Errors use the standard envelope:
                                   Emitter
 ```
 
-Consumers implement a two-method `Protocol` (`on_frame`, `close`) — the Streamer dispatches synchronously on its acquisition thread, so a slow consumer naturally throttles capture. Wrap in a queued forwarder if you need true decoupling.
+The `Acquirer` serializes reads and configuration changes, preventing exposure
+or device-switch operations from racing an in-flight hardware read. Blocking
+acquisition, threaded streaming, the TUI, and the Rust bridge all construct the
+same validated `SpectrumFrame`. The Textual TUI uses the public consumer writers
+through `SpectrumRecorder`, so interactive and headless recordings have
+identical schemas.
+
+Consumers implement a two-method `Protocol` (`on_frame`, `close`) — the
+Streamer dispatches synchronously on its acquisition thread, so a slow consumer
+naturally throttles capture. Wrap in a queued forwarder if you need true
+decoupling.
 
 ## Status
 
-Single-device, software-timed acquisition only. The following are stubbed for forward-compatibility and will raise `NotImplementedError`:
+Single-device acquisition only. Hardware trigger support depends on the selected
+Ocean Optics model and python-seabreeze backend. The simulator intentionally
+raises `NotImplementedError` for non-normal trigger modes.
 
-- `TriggerMode.EXTERNAL_*` on `MockDevice`
-- multi-device groups (no class yet; open one device at a time)
+- multi-device groups are not implemented; open one device per service process
 
 ## Tests
 
@@ -178,4 +240,6 @@ Single-device, software-timed acquisition only. The following are stubbed for fo
 uv run pytest
 ```
 
-The entire test suite runs against `MockDevice`; no hardware required.
+The complete test suite runs against `MockDevice`; no hardware is required.
+It covers acquisition, stream consumers, buffered HDF5 close behavior,
+snapshots, display processing, the JSON-RPC bridge, and TUI recording schema.

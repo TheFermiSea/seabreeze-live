@@ -2,9 +2,9 @@ from __future__ import annotations
 
 import json
 import sys
-from typing import TextIO
 
 from seabreeze_live.frame import SpectrumFrame
+from seabreeze_live.interfaces import TextWriter
 
 
 class NdjsonStdoutEmitter:
@@ -21,22 +21,18 @@ class NdjsonStdoutEmitter:
          "values": [float, ...], "axis": [float, ...]}
     """
 
-    def __init__(self, stream: TextIO | None = None) -> None:
-        self.stream: TextIO = stream if stream is not None else sys.stdout
+    def __init__(
+        self,
+        stream: TextWriter | None = None,
+        *,
+        include_context: bool = True,
+    ) -> None:
+        self.stream: TextWriter = stream if stream is not None else sys.stdout
+        self.include_context = include_context
 
     def on_frame(self, frame: SpectrumFrame) -> None:
-        payload = {
-            "type": "spectrum",
-            "timestamp_ns": frame.timestamp_ns,
-            "frame_number": frame.frame_number,
-            "integration_time_us": frame.integration_time_us,
-            "device_serial": frame.device_serial,
-            "value_units": frame.value_units,
-            "axis_units": frame.axis_units,
-            "values": frame.values.tolist(),
-            "axis": frame.axis.tolist(),
-        }
-        self.stream.write(json.dumps(payload, separators=(",", ":")))
+        payload = frame.to_wire(include_context=self.include_context)
+        self.stream.write(json.dumps(payload, separators=(",", ":"), allow_nan=False))
         self.stream.write("\n")
         self.stream.flush()
 
