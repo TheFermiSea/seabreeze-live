@@ -1,20 +1,34 @@
 [project]
 name = "seabreeze-live"
-version = "0.2.0"
+version = "0.3.0"
 description = "Live Ocean Optics spectrometer acquisition and visualization TUI"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
   "seabreeze>=2.0.0",
   "numpy>=1.24.0",
-  "scipy>=1.10.0",
-  "h5py>=3.8.0",
-  "textual>=0.50.0",
-  "textual-plotext>=0.2.0",
+  "typing-extensions>=4.4.0",
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=8.0.0", "ruff>=0.2.0"]
+hdf5 = ["h5py>=3.8.0"]
+plot = ["matplotlib>=3.8.0"]
+ui = ["textual>=0.50.0", "textual-plotext>=0.2.0"]
+all = [
+  "h5py>=3.8.0",
+  "matplotlib>=3.8.0",
+  "textual>=0.50.0",
+  "textual-plotext>=0.2.0",
+]
+dev = [
+  "h5py>=3.8.0",
+  "matplotlib>=3.8.0",
+  "pyright>=1.1.400",
+  "pytest>=8.0.0",
+  "ruff>=0.16.0",
+  "textual>=0.50.0",
+  "textual-plotext>=0.2.0",
+]
 
 [project.scripts]
 seabreeze-live = "seabreeze_live.cli:main"

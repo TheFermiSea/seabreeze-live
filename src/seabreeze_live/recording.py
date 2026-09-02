@@ -11,7 +11,8 @@ from pathlib import Path
 import numpy as np
 
 from seabreeze_live.acquisition import Consumer
-from seabreeze_live.consumers import CsvWriter, Hdf5Writer
+from seabreeze_live.consumers.csv import CsvWriter
+from seabreeze_live.consumers.hdf5 import Hdf5Writer
 from seabreeze_live.frame import SpectrumFrame
 
 
@@ -31,6 +32,11 @@ class SpectrumRecorder:
         self.path = Path(path)
         self._closed = False
 
+    def on_frame(self, frame: SpectrumFrame) -> None:
+        if self._closed:
+            raise RuntimeError("recorder is closed")
+        self._consumer.on_frame(frame)
+
     def write(
         self,
         *,
@@ -41,9 +47,7 @@ class SpectrumRecorder:
         integration_time_us: int,
         device_serial: str,
     ) -> None:
-        if self._closed:
-            raise RuntimeError("recorder is closed")
-        self._consumer.on_frame(
+        self.on_frame(
             SpectrumFrame(
                 values=values,
                 axis=axis,

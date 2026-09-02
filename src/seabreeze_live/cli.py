@@ -3,8 +3,10 @@
 import argparse
 import time
 
-from seabreeze_live.consumers.live_view import run_tui
+from seabreeze_live.acquisition import Streamer
+from seabreeze_live.consumers.ndjson_stdout import NdjsonStdoutEmitter
 from seabreeze_live.device import HardwareConnectionError, SpectrometerDevice
+from seabreeze_live.interfaces import Spectrometer
 from seabreeze_live.mock import MockDevice
 from seabreeze_live.rpc import RpcServer
 
@@ -21,9 +23,7 @@ def build_parser() -> argparse.ArgumentParser:
         "view", help="Launch interactive Textual TUI live view"
     )
     _add_device_args(tui_parser)
-    tui_parser.set_defaults(
-        func=lambda args: run_tui(args.device, args.integration_time, args.mock)
-    )
+    tui_parser.set_defaults(func=_handle_tui)
 
     # CLI Stream Command
     stream_parser = subparsers.add_parser(
@@ -45,7 +45,15 @@ def build_parser() -> argparse.ArgumentParser:
     serve_parser.add_argument(
         "--mock", action="store_true", help="Use the mock spectrometer"
     )
-    serve_parser.add_argument("-d", "--device", type=str, default=None)
+    serve_parser.add_argument(
+        "-d",
+        "--device",
+        "--serial",
+        dest="device",
+        type=str,
+        default=None,
+        help="Spectrometer serial number",
+    )
     serve_parser.set_defaults(func=_handle_serve)
 
     # Direct fallback options for root command
@@ -55,7 +63,13 @@ def build_parser() -> argparse.ArgumentParser:
 
 def _add_device_args(parser: argparse.ArgumentParser):
     parser.add_argument(
-        "-d", "--device", type=str, default=None, help="Spectrometer serial number"
+        "-d",
+        "--device",
+        "--serial",
+        dest="device",
+        type=str,
+        default=None,
+        help="Spectrometer serial number",
     )
     parser.add_argument(
         "-i",
@@ -69,7 +83,7 @@ def _add_device_args(parser: argparse.ArgumentParser):
     )
 
 
-def _handle_list_devices(args: argparse.Namespace):
+def _handle_list_devices(_args: argparse.Namespace) -> None:
     devices = SpectrometerDevice.list_available_devices()
     print("\nAvailable Spectrometers:")
     for d in devices:
@@ -78,17 +92,46 @@ def _handle_list_devices(args: argparse.Namespace):
     print()
 
 
-def _handle_stream(args: argparse.Namespace):
-    dev = SpectrometerDevice(device_id=args.device, use_mock=args.mock)
-    dev.set_integration_time_micros(args.integration_time)
-    meta = dev.meta
+def _open_device(args: argparse.Namespace) -> Spectrometer:
+    if args.mock:
+        return MockDevice()
+    return SpectrometerDevice(device_id=args.device)
+
+
+def _handle_tui(args: argparse.Namespace) -> None:
+    try:
+        from seabreeze_live.consumers.live_view import run_tui
+    except ImportError as error:
+        raise SystemExit(
+            "The interactive UI requires the 'ui' extra: "
+            "pip install 'seabreeze-live[ui]'"
+        ) from error
+
+    run_tui(args.device, args.integration_time, args.mock)
+
+
+def _handle_stream(args: argparse.Namespace) -> None:
+    dev = _open_device(args)
+    dev.set_integration_time(args.integration_time)
+    if args.format == "ndjson":
+        streamer = Streamer(dev, [NdjsonStdoutEmitter()])
+        try:
+            streamer.start()
+            streamer.wait()
+        except KeyboardInterrupt:
+            pass
+        finally:
+            streamer.stop()
+            dev.close()
+        return
+
     print(
-        f"Streaming from {meta.model} ({meta.serial_number})... Press Ctrl+C to stop.\n"
+        f"Streaming from {dev.model} ({dev.serial_number})... Press Ctrl+C to stop.\n"
     )
     try:
         while True:
-            intensities = dev.get_intensities()
-            wl = dev.get_wavelengths()
+            intensities = dev.read_intensities()
+            wl = dev.wavelengths()
             peak_idx = int(intensities.argmax())
             print(
                 f"\rPeak: {wl[peak_idx]:.2f} nm | Counts: {intensities[peak_idx]:.1f} | Saturated: {bool(intensities.max() >= 65000)}",
@@ -102,7 +145,7 @@ def _handle_stream(args: argparse.Namespace):
 
 
 def _handle_serve(args: argparse.Namespace) -> None:
-    device = MockDevice() if args.mock else SpectrometerDevice(device_id=args.device)
+    device = _open_device(args)
     server = RpcServer(device)
     try:
         server.emit_ready()
@@ -118,11 +161,7 @@ def main():
     try:
         if args.command is None:
             # Default behavior: run TUI
-            run_tui(
-                device=args.device,
-                integration_time_us=args.integration_time,
-                use_mock=args.mock,
-            )
+            _handle_tui(args)
         else:
             args.func(args)
     except HardwareConnectionError as error:

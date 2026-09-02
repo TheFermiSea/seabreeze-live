@@ -1,16 +1,23 @@
+"""Line-delimited JSON-RPC service consumed by rust-daq's SeaBreeze driver."""
+
 from __future__ import annotations
 
 import json
+import logging
 import sys
 import threading
-from typing import Any, Callable, TextIO
+from collections.abc import Callable
+from enum import Enum
+from typing import Any, TextIO
 
 from seabreeze_live.acquisition import Streamer
-from seabreeze_live.consumers import NdjsonStdoutEmitter
-from seabreeze_live.device import SpectrometerDevice, TriggerMode
+from seabreeze_live.consumers.ndjson_stdout import NdjsonStdoutEmitter
+from seabreeze_live.device import TriggerMode
+from seabreeze_live.interfaces import Spectrometer, TextWriter
 
+logger = logging.getLogger(__name__)
 
-# JSON-RPC 2.0 error codes
+PROTOCOL_VERSION = "1.0"
 PARSE_ERROR = -32700
 INVALID_REQUEST = -32600
 METHOD_NOT_FOUND = -32601
@@ -18,26 +25,30 @@ INVALID_PARAMS = -32602
 INTERNAL_ERROR = -32603
 
 
-class _LockedStream:
-    """Wrap a text stream so concurrent writers serialize line-level writes.
+class RpcMethod(str, Enum):
+    SET_INTEGRATION_TIME_US = "set_integration_time_us"
+    SET_TRIGGER_MODE = "set_trigger_mode"
+    GET_WAVELENGTHS = "get_wavelengths"
+    GET_DEVICE_INFO = "get_device_info"
+    START_STREAM = "start_stream"
+    STOP_STREAM = "stop_stream"
+    SHUTDOWN = "shutdown"
 
-    The streamer thread (via NdjsonStdoutEmitter) and the RPC dispatcher
-    both publish to stdout. Holding the lock for the full ``write``+``flush``
-    sequence keeps frame and response objects from interleaving on a line.
-    """
+
+class _LockedStream:
+    """Serialize complete NDJSON lines written by the acquisition thread."""
 
     def __init__(self, stream: TextIO, lock: threading.Lock) -> None:
         self._stream = stream
         self._lock = lock
-        self._buf: list[str] = []
+        self._buffer: list[str] = []
 
     def write(self, data: str) -> int:
-        # Buffer until we see a newline, then flush atomically under the lock.
-        self._buf.append(data)
+        self._buffer.append(data)
         if "\n" not in data:
             return len(data)
-        line = "".join(self._buf)
-        self._buf.clear()
+        line = "".join(self._buffer)
+        self._buffer.clear()
         with self._lock:
             self._stream.write(line)
             self._stream.flush()
@@ -49,219 +60,201 @@ class _LockedStream:
 
 
 def _trigger_mode_from_str(mode: str) -> TriggerMode:
+    aliases = {
+        "EXTERNAL_SOFTWARE": TriggerMode.SOFTWARE,
+        "EXTERNAL_SYNCHRONIZATION": TriggerMode.EXTERNAL_SYNC,
+    }
+    normalized = mode.upper()
+    if normalized in aliases:
+        return aliases[normalized]
     try:
-        return TriggerMode[mode.upper()]
-    except KeyError as e:
-        raise ValueError(f"unknown trigger mode {mode!r}") from e
+        return TriggerMode[normalized]
+    except KeyError as error:
+        raise ValueError(f"unknown trigger mode {mode!r}") from error
 
 
 class RpcServer:
-    """Line-delimited JSON-RPC 2.0 server bound to a spectrometer device.
-
-    Reads requests one per line from ``stdin`` and writes one response per
-    line to ``stdout``. Responses always carry a ``"jsonrpc": "2.0"`` key
-    so a Rust parent can discriminate them from NDJSON spectrum frames
-    (which never carry that key).
-
-    The server is single-threaded for dispatch; long-running operations
-    (streaming) run on the existing ``Streamer`` background thread. Stdout
-    writes from the streamer and from RPC responses share a lock so lines
-    never interleave.
-    """
+    """Stdio service implementing rust-daq's ``seabreeze-protocol`` v1."""
 
     def __init__(
         self,
-        device: SpectrometerDevice,
+        device: Spectrometer,
         *,
         stdin: TextIO | None = None,
         stdout: TextIO | None = None,
     ) -> None:
         self.device = device
-        self._stdin: TextIO = stdin if stdin is not None else sys.stdin
-        self._raw_stdout: TextIO = stdout if stdout is not None else sys.stdout
+        self._stdin = stdin if stdin is not None else sys.stdin
+        self._stdout = stdout if stdout is not None else sys.stdout
         self._stdout_lock = threading.Lock()
-        self._locked_stdout = _LockedStream(self._raw_stdout, self._stdout_lock)
-
+        self._frame_stream: TextWriter = _LockedStream(self._stdout, self._stdout_lock)
         self._streamer: Streamer | None = None
         self._shutdown = False
-
         self._methods: dict[str, Callable[[dict[str, Any]], Any]] = {
-            "set_integration_time_us": self._m_set_integration_time_us,
-            "set_trigger_mode": self._m_set_trigger_mode,
-            "get_wavelengths": self._m_get_wavelengths,
-            "get_device_info": self._m_get_device_info,
-            "start_stream": self._m_start_stream,
-            "stop_stream": self._m_stop_stream,
-            "shutdown": self._m_shutdown,
+            RpcMethod.SET_INTEGRATION_TIME_US.value: self._set_integration_time,
+            RpcMethod.SET_TRIGGER_MODE.value: self._set_trigger_mode,
+            RpcMethod.GET_WAVELENGTHS.value: self._get_wavelengths,
+            RpcMethod.GET_DEVICE_INFO.value: self._get_device_info,
+            RpcMethod.START_STREAM.value: self._start_stream,
+            RpcMethod.STOP_STREAM.value: self._stop_stream,
+            RpcMethod.SHUTDOWN.value: self._request_shutdown,
         }
 
-    # ----- public API ---------------------------------------------------
-
     def device_info(self) -> dict[str, Any]:
-        """Snapshot of static device metadata, used in the ``ready`` banner."""
-        serial = getattr(self.device, "serial_number", None)
         return {
-            "model": getattr(self.device, "model", "unknown"),
-            "serial": serial,
-            "pixel_count": int(getattr(self.device, "pixels", 0)),
-            "integration_time_limits_us": list(
-                getattr(self.device, "integration_time_limits_us", (0, 0))
-            ),
+            "model": self.device.model,
+            "serial": self.device.serial_number or None,
+            "pixel_count": self.device.pixels,
+            "integration_time_limits_us": list(self.device.integration_time_limits_us),
         }
 
     def emit_ready(self) -> None:
-        """Write the single startup banner line announcing the device."""
-        banner = {
-            "jsonrpc": "2.0",
-            "ready": True,
-            "device": self.device_info(),
-        }
-        self._write_line(banner)
+        self._write_line(
+            {
+                "jsonrpc": "2.0",
+                "ready": True,
+                "protocol_version": PROTOCOL_VERSION,
+                "device": self.device_info(),
+            }
+        )
 
     def serve_forever(self) -> None:
-        """Block reading stdin until EOF or a ``shutdown`` RPC."""
-        for raw in self._stdin:
-            line = raw.strip()
-            if not line:
-                continue
-            self._handle_line(line)
-            if self._shutdown:
-                break
-        # If EOF was reached without an explicit shutdown, still tear down.
-        self._teardown()
-
-    # ----- request handling --------------------------------------------
+        try:
+            for raw in self._stdin:
+                line = raw.strip()
+                if line:
+                    self._handle_line(line)
+                if self._shutdown:
+                    break
+        finally:
+            self._teardown()
 
     def _handle_line(self, line: str) -> None:
-        req_id: Any = None
         try:
-            req = json.loads(line)
-        except json.JSONDecodeError as e:
-            self._write_error(None, PARSE_ERROR, f"parse error: {e}")
+            request = json.loads(line)
+        except json.JSONDecodeError as error:
+            self._write_error(None, PARSE_ERROR, f"parse error: {error}")
             return
 
-        if not isinstance(req, dict):
+        if not isinstance(request, dict):
             self._write_error(None, INVALID_REQUEST, "request must be an object")
             return
 
-        req_id = req.get("id")
-        if req.get("jsonrpc") != "2.0":
-            self._write_error(req_id, INVALID_REQUEST, "missing jsonrpc=='2.0'")
+        request_id = request.get("id")
+        if request.get("jsonrpc") != "2.0":
+            self._write_error(request_id, INVALID_REQUEST, "missing jsonrpc=='2.0'")
+            return
+        if not isinstance(request_id, int) or isinstance(request_id, bool):
+            self._write_error(None, INVALID_REQUEST, "id must be an integer")
             return
 
-        method = req.get("method")
+        method = request.get("method")
         if not isinstance(method, str):
-            self._write_error(req_id, INVALID_REQUEST, "missing method")
+            self._write_error(request_id, INVALID_REQUEST, "missing method")
             return
 
-        params = req.get("params") or {}
+        params = request.get("params", {})
+        if params is None:
+            params = {}
         if not isinstance(params, dict):
             self._write_error(
-                req_id, INVALID_PARAMS, "params must be an object or omitted"
+                request_id, INVALID_PARAMS, "params must be an object or omitted"
             )
             return
 
         handler = self._methods.get(method)
         if handler is None:
-            self._write_error(req_id, METHOD_NOT_FOUND, f"unknown method {method!r}")
+            self._write_error(
+                request_id, METHOD_NOT_FOUND, f"unknown method {method!r}"
+            )
             return
 
         try:
             result = handler(params)
-        except NotImplementedError as e:
-            self._write_error(req_id, INTERNAL_ERROR, f"not implemented: {e}")
+        except NotImplementedError as error:
+            self._write_error(request_id, INTERNAL_ERROR, f"not implemented: {error}")
             return
-        except (TypeError, ValueError, KeyError) as e:
-            self._write_error(req_id, INVALID_PARAMS, str(e))
+        except (TypeError, ValueError, KeyError) as error:
+            self._write_error(request_id, INVALID_PARAMS, str(error))
             return
-        except Exception as e:  # noqa: BLE001 — surface to the client
-            self._write_error(req_id, INTERNAL_ERROR, str(e))
+        except Exception as error:
+            logger.exception("SeaBreeze RPC method %s failed", method)
+            self._write_error(request_id, INTERNAL_ERROR, str(error))
             return
 
-        self._write_result(req_id, result)
+        self._write_result(request_id, result)
 
-    # ----- methods ------------------------------------------------------
-
-    def _m_set_integration_time_us(self, params: dict[str, Any]) -> dict[str, Any]:
+    def _set_integration_time(self, params: dict[str, Any]) -> None:
         value = params.get("value")
-        if not isinstance(value, int):
-            raise ValueError("param 'value' must be an integer (microseconds)")
+        if not isinstance(value, int) or isinstance(value, bool):
+            raise TypeError("param 'value' must be an integer (microseconds)")
         self.device.set_integration_time(value)
-        return {"ok": True}
 
-    def _m_set_trigger_mode(self, params: dict[str, Any]) -> dict[str, Any]:
+    def _set_trigger_mode(self, params: dict[str, Any]) -> None:
         mode = params.get("mode")
         if not isinstance(mode, str):
-            raise ValueError("param 'mode' must be a string")
-        tm = _trigger_mode_from_str(mode)
-        # Device may raise NotImplementedError for unsupported modes; that
-        # propagates up to _handle_line and becomes a JSON-RPC error.
-        self.device.set_trigger_mode(tm)
-        return {"ok": True}
+            raise TypeError("param 'mode' must be a string")
+        self.device.set_trigger_mode(int(_trigger_mode_from_str(mode)))
 
-    def _m_get_wavelengths(self, _params: dict[str, Any]) -> list[float]:
-        return [float(x) for x in self.device.wavelengths()]
+    def _get_wavelengths(self, _params: dict[str, Any]) -> list[float]:
+        return self.device.wavelengths().tolist()
 
-    def _m_get_device_info(self, _params: dict[str, Any]) -> dict[str, Any]:
+    def _get_device_info(self, _params: dict[str, Any]) -> dict[str, Any]:
         return self.device_info()
 
-    def _m_start_stream(self, params: dict[str, Any]) -> dict[str, Any]:
-        if self._streamer is not None and self._streamer.is_running:
-            raise RuntimeError("stream already running")
+    def _start_stream(self, params: dict[str, Any]) -> None:
+        if self._streamer is not None:
+            if self._streamer.is_running:
+                raise RuntimeError("stream already running")
+            self._streamer.stop()
 
         integration = params.get("integration_time_us")
         if integration is not None:
-            if not isinstance(integration, int):
-                raise ValueError("param 'integration_time_us' must be an integer")
+            if not isinstance(integration, int) or isinstance(integration, bool):
+                raise TypeError("param 'integration_time_us' must be an integer")
             self.device.set_integration_time(integration)
 
-        emitter = NdjsonStdoutEmitter(stream=self._locked_stdout)
+        # rust-daq caches the wavelength axis during the handshake. Its event
+        # schema needs only timing + values, halving steady-state JSON traffic.
+        emitter = NdjsonStdoutEmitter(stream=self._frame_stream, include_context=False)
         self._streamer = Streamer(self.device, [emitter])
         self._streamer.start()
-        return {"ok": True}
 
-    def _m_stop_stream(self, _params: dict[str, Any]) -> dict[str, Any]:
-        if self._streamer is None or not self._streamer.is_running:
-            return {"ok": True, "was_running": False}
-        self._streamer.stop()
-        self._streamer = None
-        return {"ok": True}
+    def _stop_stream(self, _params: dict[str, Any]) -> None:
+        if self._streamer is not None:
+            self._streamer.stop()
+            self._streamer = None
 
-    def _m_shutdown(self, _params: dict[str, Any]) -> dict[str, Any]:
+    def _request_shutdown(self, _params: dict[str, Any]) -> None:
         self._shutdown = True
-        return {"ok": True}
-
-    # ----- teardown -----------------------------------------------------
 
     def _teardown(self) -> None:
-        if self._streamer is not None and self._streamer.is_running:
+        if self._streamer is not None:
             try:
-                self._streamer.stop()
-            except Exception:  # noqa: BLE001 — best-effort teardown
-                pass
+                self._streamer.stop(timeout=None)
+            except Exception as error:
+                logger.exception("failed to stop SeaBreeze stream", exc_info=error)
             self._streamer = None
         try:
             self.device.close()
-        except Exception:  # noqa: BLE001
-            pass
+        except Exception as error:
+            logger.exception("failed to close SeaBreeze device", exc_info=error)
 
-    # ----- framing ------------------------------------------------------
-
-    def _write_line(self, obj: dict[str, Any]) -> None:
-        data = json.dumps(obj, separators=(",", ":"))
+    def _write_line(self, value: dict[str, Any]) -> None:
+        data = json.dumps(value, separators=(",", ":"), allow_nan=False)
         with self._stdout_lock:
-            self._raw_stdout.write(data)
-            self._raw_stdout.write("\n")
-            self._raw_stdout.flush()
+            self._stdout.write(data)
+            self._stdout.write("\n")
+            self._stdout.flush()
 
-    def _write_result(self, req_id: Any, result: Any) -> None:
-        self._write_line({"jsonrpc": "2.0", "id": req_id, "result": result})
+    def _write_result(self, request_id: int, result: Any) -> None:
+        self._write_line({"jsonrpc": "2.0", "id": request_id, "result": result})
 
-    def _write_error(self, req_id: Any, code: int, message: str) -> None:
+    def _write_error(self, request_id: Any, code: int, message: str) -> None:
         self._write_line(
             {
                 "jsonrpc": "2.0",
-                "id": req_id,
+                "id": request_id,
                 "error": {"code": code, "message": message},
             }
         )

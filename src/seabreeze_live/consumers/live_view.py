@@ -9,7 +9,7 @@ from typing import ClassVar
 import numpy as np
 from textual import on, work
 from textual.app import App, ComposeResult
-from textual.binding import Binding
+from textual.binding import Binding, BindingType
 from textual.containers import Container, Horizontal, Vertical, VerticalScroll
 from textual.css.query import NoMatches
 from textual.reactive import reactive
@@ -26,12 +26,15 @@ from textual.widgets import (
 )
 from textual_plotext import PlotextPlot
 
-from seabreeze_live.device import SpectrometerDevice
+from seabreeze_live.acquisition import Acquirer, AcquisitionSettings
+from seabreeze_live.device import (
+    HardwareConnectionError,
+    HardwareOperationError,
+    SpectrometerDevice,
+)
 from seabreeze_live.frame import SpectrumFrame
 from seabreeze_live.processing import (
-    average_scans,
     display_values,
-    smooth_boxcar,
     wavelength_mask,
 )
 from seabreeze_live.recording import SpectrumRecorder
@@ -97,7 +100,7 @@ class MatplotlibLiveView:
         axis.set_xlabel("Wavelength (nm)")
         axis.set_ylabel("Intensity (counts)")
 
-        def update(_: object) -> tuple[object, ...]:
+        def update(_: object):
             frame = self.latest_frame
             if frame is not None:
                 line.set_data(frame.axis, frame.values)
@@ -184,7 +187,7 @@ class LiveSpectrometerApp(App):
     }
     """
 
-    BINDINGS: ClassVar[list[Binding]] = [
+    BINDINGS: ClassVar[list[BindingType]] = [
         Binding("q", "quit", "Quit", show=True),
         Binding("space", "toggle_pause", "Pause/Play", show=True),
         Binding("d", "capture_dark", "Take Dark", show=True),
@@ -209,17 +212,20 @@ class LiveSpectrometerApp(App):
         device_id: str | None = None,
         integration_time_us: int = 100_000,
         use_mock: bool = False,
+        output_dir: str | Path = "spectra",
     ):
         super().__init__()
         self.initial_device_id = device_id
         self.initial_integration_us = integration_time_us
         self.initial_use_mock = use_mock
+        self.output_dir = Path(output_dir)
         self._is_active = True
 
         self.dev = SpectrometerDevice(device_id=device_id, use_mock=use_mock)
         self.integration_time_us = self.dev.set_integration_time_micros(
             integration_time_us
         )
+        self._acquirer = Acquirer(self.dev, AcquisitionSettings())
 
         # Optical Baselines & Processing
         self.dark_spectrum: np.ndarray | None = None
@@ -232,6 +238,7 @@ class LiveSpectrometerApp(App):
         # Live State
         self.latest_wl: np.ndarray = self.dev.get_wavelengths()
         self.latest_intensities: np.ndarray = np.zeros_like(self.latest_wl)
+        self.latest_frame: SpectrumFrame | None = None
         self.fps: float = 0.0
         self._last_frame_t: float = time.perf_counter()
         self._next_render_at: float = 0.0
@@ -400,7 +407,7 @@ class LiveSpectrometerApp(App):
     def on_unmount(self):
         self._is_active = False
         self._stop_recording()
-        self.dev.close()
+        self._acquirer.close()
 
     def log_msg(self, text: str):
         if not self._is_active:
@@ -424,27 +431,15 @@ class LiveSpectrometerApp(App):
                         self.fps = 0.9 * self.fps + 0.1 * (1.0 / dt)
                     self._last_frame_t = now
 
-                    raw = average_scans(
-                        lambda: self.dev.get_intensities(
-                            correct_dark_pixels=self.correct_dark_pixels,
-                            correct_nonlinearity=self.correct_nonlinearity,
-                        ),
-                        self.scans_to_average,
-                    )
-                    raw = smooth_boxcar(raw, self.boxcar_width)
-
+                    frame = self._acquirer.capture()
+                    raw = frame.values
+                    self.latest_wl = frame.axis
                     self.latest_intensities = raw
+                    self.latest_frame = frame
 
                     if self._recorder is not None:
-                        self._recorder.write(
-                            values=raw,
-                            axis=self.latest_wl,
-                            timestamp_ns=time.time_ns(),
-                            frame_number=self._frame_number,
-                            integration_time_us=self.integration_time_us,
-                            device_serial=self.dev.serial_number,
-                        )
-                    self._frame_number += 1
+                        self._recorder.on_frame(frame)
+                    self._frame_number = frame.frame_number + 1
 
                     # Terminal rendering is much slower than acquisition. Coalesce
                     # frames so plotting cannot flood Textual's message queue.
@@ -604,54 +599,89 @@ class LiveSpectrometerApp(App):
     @on(Select.Changed, "#select-device")
     def on_device_select(self, event: Select.Changed):
         if event.value != Select.BLANK:
-            self.dev.open(str(event.value))
-            self.integration_time_us = self.dev.set_integration_time_micros(
-                self.integration_time_us
+            target = str(event.value)
+            current = (
+                "MOCK-SIMULATOR"
+                if self.dev.meta and self.dev.meta.is_mock
+                else self.dev.serial_number
             )
-            self.latest_wl = self.dev.get_wavelengths()
+            if target == current:
+                return
+            try:
+                replacement = SpectrometerDevice(device_id=target)
+                self.integration_time_us = replacement.set_integration_time_micros(
+                    self.integration_time_us
+                )
+            except (HardwareConnectionError, HardwareOperationError) as error:
+                self.log_msg(f"[red]Could not connect: {error}[/]")
+                return
+            self._acquirer.replace_device(replacement)
+            self.dev = replacement
+            self.latest_wl = replacement.get_wavelengths()
             self.latest_intensities = np.zeros_like(self.latest_wl)
+            self.latest_frame = None
             self._frame_number = 0
-            self.log_msg(f"Connected to spectrometer: [bold]{event.value}[/]")
+            self.log_msg(f"Connected to spectrometer: [bold]{target}[/]")
 
-    @on(Input.Changed, "#inp-integration")
-    def on_integration_change(self, event: Input.Changed):
+    @on(Input.Submitted, "#inp-integration")
+    def on_integration_change(self, event: Input.Submitted):
         if event.value.isdigit():
             val = int(event.value)
-            self.integration_time_us = self.dev.set_integration_time_micros(val)
+            try:
+                self.integration_time_us = self._acquirer.set_integration_time(val)
+            except (HardwareConnectionError, HardwareOperationError) as error:
+                self.log_msg(f"[red]Integration-time update failed: {error}[/]")
+                return
             self.log_msg(f"Integration time: [bold]{self.integration_time_us:,}[/] µs")
 
     @on(Input.Changed, "#inp-average")
     def on_average_change(self, event: Input.Changed):
         if event.value.isdigit() and int(event.value) > 0:
             self.scans_to_average = int(event.value)
+            self._acquirer.configure(scans_to_average=self.scans_to_average)
 
     @on(Input.Changed, "#inp-boxcar")
     def on_boxcar_change(self, event: Input.Changed):
         if event.value.isdigit():
             self.boxcar_width = int(event.value)
+            self._acquirer.configure(boxcar_width=self.boxcar_width)
 
     @on(Select.Changed, "#select-trigger")
     def on_trigger_change(self, event: Select.Changed):
         if event.value != Select.BLANK:
-            self.dev.set_trigger_mode(int(event.value))
+            try:
+                self._acquirer.set_trigger_mode(int(str(event.value)))
+            except (NotImplementedError, HardwareOperationError) as error:
+                self.log_msg(f"[red]Trigger update failed: {error}[/]")
+                return
             self.log_msg(f"Trigger mode set to {event.value}")
 
     @on(Switch.Changed, "#sw-dark-pix")
     def on_dark_pix_switch(self, event: Switch.Changed):
         self.correct_dark_pixels = event.value
+        self._acquirer.configure(correct_dark=event.value)
 
     @on(Switch.Changed, "#sw-nonlin")
     def on_nonlin_switch(self, event: Switch.Changed):
         self.correct_nonlinearity = event.value
+        self._acquirer.configure(correct_nonlinearity=event.value)
 
     @on(Switch.Changed, "#sw-lamp")
     def on_lamp_switch(self, event: Switch.Changed):
-        self.dev.set_lamp_enable(event.value)
+        try:
+            self.dev.set_lamp_enable(event.value)
+        except (NotImplementedError, HardwareOperationError) as error:
+            self.log_msg(f"[red]Lamp update failed: {error}[/]")
+            return
         self.log_msg(f"Light Source: {'ON' if event.value else 'OFF'}")
 
     @on(Switch.Changed, "#sw-shutter")
     def on_shutter_switch(self, event: Switch.Changed):
-        self.dev.set_shutter_open(event.value)
+        try:
+            self.dev.set_shutter_open(event.value)
+        except (NotImplementedError, HardwareOperationError) as error:
+            self.log_msg(f"[red]Shutter update failed: {error}[/]")
+            return
         self.log_msg(f"Shutter: {'OPEN' if event.value else 'CLOSED'}")
 
     @on(Select.Changed, "#select-mode")
@@ -678,17 +708,10 @@ class LiveSpectrometerApp(App):
 
     @on(Button.Pressed, "#btn-snapshot")
     def action_take_snapshot(self):
-        path = save_snapshot(
-            SpectrumFrame(
-                values=self.latest_intensities,
-                axis=self.latest_wl,
-                timestamp_ns=time.time_ns(),
-                frame_number=self._frame_number,
-                integration_time_us=self.integration_time_us,
-                device_serial=self.dev.serial_number,
-            ),
-            ".",
-        )
+        if self.latest_frame is None:
+            self.log_msg("[yellow]No spectrum is available to save yet.[/]")
+            return
+        path = save_snapshot(self.latest_frame, self.output_dir)
         self.log_msg(f"[bold green]Saved snapshot to {path.resolve()}[/]")
 
     @on(Button.Pressed, "#btn-record")
@@ -697,7 +720,8 @@ class LiveSpectrometerApp(App):
         if not self.recording_active:
             fmt = str(self.query_one("#select-rec-fmt", Select).value or "CSV")
             ts = time.strftime("%Y%m%d_%H%M%S")
-            path = Path(f"spectrum_log_{ts}.{fmt.lower()}")
+            self.output_dir.mkdir(parents=True, exist_ok=True)
+            path = self.output_dir / f"spectrum_log_{ts}.{fmt.lower()}"
             self._recorder = SpectrumRecorder(path, fmt)
             self.recording_active = True
             btn.label = "Stop Recording"

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import csv
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 from seabreeze_live.frame import SpectrumFrame
@@ -27,7 +27,7 @@ def save_snapshot(
     """
     directory = Path(directory)
     directory.mkdir(parents=True, exist_ok=True)
-    stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S_%f")
     stem = f"spectrum_{stamp}"
 
     if fmt == "csv":

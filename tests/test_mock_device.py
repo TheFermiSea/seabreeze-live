@@ -2,7 +2,12 @@ import numpy as np
 import pytest
 
 import seabreeze_live.device as device_module
-from seabreeze_live import HardwareConnectionError, MockDevice, TriggerMode
+from seabreeze_live import (
+    HardwareConnectionError,
+    HardwareOperationError,
+    MockDevice,
+    TriggerMode,
+)
 
 
 def _fast_mock(**kwargs):
@@ -118,3 +123,19 @@ def test_real_hardware_never_silently_falls_back_to_mock(monkeypatch):
         HardwareConnectionError, match="python-seabreeze is unavailable"
     ):
         device_module.SpectrometerDevice()
+
+
+def test_hardware_control_errors_are_not_silently_suppressed(monkeypatch):
+    class FailingTrigger(_FakeSpectrometer):
+        def trigger_mode(self, _mode):
+            raise OSError("USB write failed")
+
+    backend = type("Backend", (), {"Spectrometer": FailingTrigger})
+    monkeypatch.setattr(device_module, "SEABREEZE_AVAILABLE", True)
+    monkeypatch.setattr(device_module, "sb", backend)
+
+    with (
+        device_module.SpectrometerDevice() as device,
+        pytest.raises(HardwareOperationError, match="trigger mode"),
+    ):
+        device.set_trigger_mode(TriggerMode.NORMAL)

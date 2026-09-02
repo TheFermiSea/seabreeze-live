@@ -5,13 +5,16 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 from enum import IntEnum
-from typing import Any, Self
+from typing import Any
 
 import numpy as np
+from typing_extensions import Self
 
+sb: Any | None = None
 try:
-    import seabreeze.spectrometers as sb
+    import seabreeze.spectrometers as _seabreeze_spectrometers
 
+    sb = _seabreeze_spectrometers
     SEABREEZE_AVAILABLE = True
 except ImportError:
     SEABREEZE_AVAILABLE = False
@@ -33,7 +36,11 @@ class HardwareConnectionError(RuntimeError):
     """A real spectrometer could not be discovered or opened."""
 
 
-@dataclass
+class HardwareOperationError(RuntimeError):
+    """A connected spectrometer rejected an operation."""
+
+
+@dataclass(frozen=True, slots=True)
 class DeviceMetadata:
     serial_number: str
     model: str
@@ -85,7 +92,7 @@ class SpectrometerDevice:
     def list_available_devices() -> list[dict[str, Any]]:
         """List discoverable hardware plus the explicit mock simulator option."""
         devices: list[dict[str, Any]] = []
-        if SEABREEZE_AVAILABLE:
+        if SEABREEZE_AVAILABLE and sb is not None:
             try:
                 for dev in sb.list_devices():
                     devices.append(
@@ -119,13 +126,14 @@ class SpectrometerDevice:
         if use_mock or device_id == "MOCK-SIMULATOR":
             self.device = MockSpectrometer()
             min_t, max_t = self.device.integration_time_micros_limits
-            self._wavelengths = self.device.wavelengths()
+            wavelengths = np.asarray(self.device.wavelengths(), dtype=np.float64)
+            self._wavelengths = wavelengths
             self.meta = DeviceMetadata(
                 serial_number=self.device.serial_number,
                 model=self.device.model,
                 min_integration_us=int(min_t),
                 max_integration_us=int(max_t),
-                pixels=len(self._wavelengths),
+                pixels=len(wavelengths),
                 has_lamp=True,
                 has_shutter=True,
                 has_temperature=True,
@@ -140,6 +148,9 @@ class SpectrometerDevice:
                 "python-seabreeze is unavailable; install it and its USB backend, "
                 "or pass --mock to use the simulator"
             )
+
+        if sb is None:
+            raise HardwareConnectionError("python-seabreeze backend did not initialize")
 
         try:
             if device_id:
@@ -207,9 +218,12 @@ class SpectrometerDevice:
     def get_wavelengths(self) -> np.ndarray:
         if self._wavelengths is None:
             if self.device is not None:
-                self._wavelengths = self.device.wavelengths()
+                self._wavelengths = np.asarray(
+                    self.device.wavelengths(), dtype=np.float64
+                )
             else:
                 self._wavelengths = np.linspace(350.0, 1000.0, 2048)
+        assert self._wavelengths is not None
         return self._wavelengths
 
     def wavelengths(self) -> np.ndarray:
@@ -256,9 +270,15 @@ class SpectrometerDevice:
                 self.meta.min_integration_us,
                 min(integration_time_us, self.meta.max_integration_us),
             )
-            self.device.integration_time_micros(clamped)
+            try:
+                self.device.integration_time_micros(clamped)
+            except Exception as error:
+                raise HardwareOperationError(
+                    f"could not set integration time to {clamped} us"
+                ) from error
             self._integration_time_us = clamped
             return clamped
+        self._integration_time_us = integration_time_us
         return integration_time_us
 
     def set_integration_time(self, microseconds: int) -> int:
@@ -267,38 +287,41 @@ class SpectrometerDevice:
     def integration_time_micros(self, us: int) -> int:
         return self.set_integration_time_micros(us)
 
-    def set_trigger_mode(self, mode: int | TriggerMode):
+    def set_trigger_mode(self, mode: int | TriggerMode) -> None:
         val = int(mode)
-        if self.device is not None and hasattr(self.device, "trigger_mode"):
-            try:
-                self.device.trigger_mode(val)
-            except Exception as error:
-                logger.debug("Could not set trigger mode", exc_info=error)
+        if self.device is None:
+            raise HardwareConnectionError("spectrometer is not connected")
+        if not hasattr(self.device, "trigger_mode"):
+            raise NotImplementedError("spectrometer does not expose trigger control")
+        try:
+            self.device.trigger_mode(val)
+        except NotImplementedError:
+            raise
+        except Exception as error:
+            raise HardwareOperationError(f"could not set trigger mode {val}") from error
 
-    def trigger_mode(self, mode: int | TriggerMode):
+    def trigger_mode(self, mode: int | TriggerMode) -> None:
         self.set_trigger_mode(mode)
 
-    def set_lamp_enable(self, state: bool):
-        if (
-            self.device is not None
-            and hasattr(self.device, "lamp")
-            and self.device.lamp
-        ):
-            try:
-                self.device.lamp.set_lamp_enable(state)
-            except Exception as error:
-                logger.debug("Could not set lamp state", exc_info=error)
+    def set_lamp_enable(self, state: bool) -> None:
+        if self.device is None:
+            raise HardwareConnectionError("spectrometer is not connected")
+        if not hasattr(self.device, "lamp") or not self.device.lamp:
+            raise NotImplementedError("spectrometer does not expose lamp control")
+        try:
+            self.device.lamp.set_lamp_enable(state)
+        except Exception as error:
+            raise HardwareOperationError("could not set lamp state") from error
 
-    def set_shutter_open(self, state: bool):
-        if (
-            self.device is not None
-            and hasattr(self.device, "shutter")
-            and self.device.shutter
-        ):
-            try:
-                self.device.shutter.set_shutter_open(state)
-            except Exception as error:
-                logger.debug("Could not set shutter state", exc_info=error)
+    def set_shutter_open(self, state: bool) -> None:
+        if self.device is None:
+            raise HardwareConnectionError("spectrometer is not connected")
+        if not hasattr(self.device, "shutter") or not self.device.shutter:
+            raise NotImplementedError("spectrometer does not expose shutter control")
+        try:
+            self.device.shutter.set_shutter_open(state)
+        except Exception as error:
+            raise HardwareOperationError("could not set shutter state") from error
 
     def read_temperatures(self) -> dict[str, float]:
         temps: dict[str, float] = {}

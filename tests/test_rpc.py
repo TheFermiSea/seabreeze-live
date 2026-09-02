@@ -7,6 +7,8 @@ import time
 
 import pytest
 
+from seabreeze_live.cli import build_parser
+
 
 def _read_line(proc: subprocess.Popen, timeout: float = 5.0) -> str:
     """Read one line from ``proc.stdout`` with a wall-clock timeout."""
@@ -41,6 +43,12 @@ def _request(proc: subprocess.Popen, req_id: int, method: str, **params) -> dict
     raise AssertionError("no matching JSON-RPC response in 200 lines")
 
 
+def test_serve_accepts_rust_driver_serial_flag():
+    args = build_parser().parse_args(["serve", "--serial", "USB2+F01234"])
+    assert args.command == "serve"
+    assert args.device == "USB2+F01234"
+
+
 @pytest.fixture
 def server():
     proc = subprocess.Popen(
@@ -64,6 +72,7 @@ def test_ready_banner(server):
     obj = json.loads(line)
     assert obj["jsonrpc"] == "2.0"
     assert obj["ready"] is True
+    assert obj["protocol_version"] == "1.0"
     info = obj["device"]
     assert info["model"] == "MockSpectrometer"
     assert info["serial"].startswith("MOCK")
@@ -84,7 +93,7 @@ def test_get_device_info(server):
 def test_set_integration_time_us(server):
     _read_line(server)
     resp = _request(server, 2, "set_integration_time_us", value=2500)
-    assert resp["result"] == {"ok": True}
+    assert resp["result"] is None
 
     # Verify via get_device_info that the device accepted it (mock has no
     # readback method, but a follow-up get_wavelengths still works which
@@ -107,7 +116,7 @@ def test_get_wavelengths_returns_axis(server):
 def test_set_trigger_mode_normal(server):
     _read_line(server)
     resp = _request(server, 5, "set_trigger_mode", mode="NORMAL")
-    assert resp["result"] == {"ok": True}
+    assert resp["result"] is None
 
 
 def test_set_trigger_mode_unsupported_returns_error(server):
@@ -129,7 +138,7 @@ def test_start_stream_emits_frames_then_stop(server):
     # Short integration time so frames arrive quickly.
     _request(server, 10, "set_integration_time_us", value=1000)
     resp = _request(server, 11, "start_stream")
-    assert resp["result"] == {"ok": True}
+    assert resp["result"] is None
 
     # Read a handful of spectrum frames (no jsonrpc key).
     frames_seen = 0
@@ -140,19 +149,19 @@ def test_start_stream_emits_frames_then_stop(server):
         if "jsonrpc" in obj:
             # An async/late RPC response slipped in — just ignore.
             continue
-        assert obj["type"] == "spectrum"
+        assert "jsonrpc" not in obj
+        assert set(obj) == {"timestamp_ns", "integration_time_us", "values"}
         assert len(obj["values"]) == 2048
-        assert len(obj["axis"]) == 2048
         frames_seen += 1
     assert frames_seen >= 3, "expected at least 3 spectrum frames"
 
     resp = _request(server, 12, "stop_stream")
-    assert resp["result"]["ok"] is True
+    assert resp["result"] is None
 
 
 def test_shutdown_exits_cleanly(server):
     _read_line(server)
     resp = _request(server, 99, "shutdown")
-    assert resp["result"] == {"ok": True}
+    assert resp["result"] is None
     rc = server.wait(timeout=5.0)
     assert rc == 0
